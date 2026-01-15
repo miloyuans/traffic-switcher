@@ -24,10 +24,10 @@ import (
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields" // 修复：导入 fields 包
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/wait" // `wait`包现在被用于Telegram消息发送的重试逻辑
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -107,7 +107,7 @@ var (
 	programPodName    = os.Getenv("POD_NAME")
 	leaderLeaseName   = "traffic-switcher-leader"
 
-	appConfig tgbotapi.BotAPI // 全局Bot实例
+	appBotApi *tgbotapi.BotAPI // 全局Bot实例，修改为指针类型
 	// 用于存储加载的全局配置，便于在各个函数中使用
 	globalAppConfig struct {
 		HTTPListenAddr    string
@@ -227,13 +227,13 @@ func run(ctx context.Context) {
 
 	// 初始化Telegram Bot API
 	var err error
-	appConfig, err = tgbotapi.NewBotAPI(telegramToken) // 使用全局bot实例
+	appBotApi, err = tgbotapi.NewBotAPI(telegramToken) // 使用全局bot实例，此处赋值给指针
 	if err != nil {
 		logger.Fatal("Failed to initialize Telegram Bot API. Please ensure TELEGRAM_BOT_TOKEN is valid.", zap.Error(err))
 	}
 
 	// 验证Telegram Token有效性
-	botUser, err := appConfig.GetMe()
+	botUser, err := appBotApi.GetMe()
 	if err != nil {
 		logger.Fatal("Telegram Token is invalid or API is unreachable. Cannot get bot information.", zap.Error(err))
 	}
@@ -244,14 +244,28 @@ func run(ctx context.Context) {
 		startupMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.StartupMessage, programPodName, programNamespace)
 		startupMsg := tgbotapi.NewMessage(telegramChatID, startupMsgText)
 		startupMsg.ParseMode = "Markdown"
-		_, err = appConfig.Send(startupMsg)
+		
+		// 发送启动消息，并增加重试逻辑
+		_, err = appBotApi.Send(startupMsg)
 		if err != nil {
-			logger.Error("Failed to send Telegram startup message. Check TELEGRAM_CHAT_ID and Bot permissions.",
-				zap.Error(err),
-				zap.Int64("chat_id", telegramChatID),
-				zap.String("message", startupMsgText))
+			logger.Error("Initial Telegram startup message send failed, retrying...", zap.Error(err), zap.Int64("chat_id", telegramChatID), zap.String("message", startupMsgText))
+			retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+				_, sendErr := appBotApi.Send(startupMsg)
+				if sendErr != nil {
+					logger.Warn("Telegram startup message retry failed", zap.Error(sendErr))
+					return false, nil // Keep retrying
+				}
+				return true, nil // Success
+			})
+			if retryErr != nil && retryErr != context.DeadlineExceeded {
+				logger.Error("Failed to send Telegram startup message after retries", zap.Error(retryErr), zap.Int64("chat_id", telegramChatID))
+			} else if retryErr == context.DeadlineExceeded {
+				logger.Warn("Telegram startup message send timed out after retries", zap.Int64("chat_id", telegramChatID))
+			} else {
+				logger.Info("Telegram startup message sent successfully after retries", zap.String("message", startupMsgText))
+			}
 		} else {
-			logger.Info("Telegram startup message sent successfully", zap.String("message", startupMsgText))
+			logger.Info("Telegram startup message sent immediately", zap.String("message", startupMsgText))
 		}
 	} else {
 		logger.Warn("Skipping Telegram startup message: TELEGRAM_CHAT_ID not set or template is empty.")
@@ -479,16 +493,11 @@ func watchConfigFile() {
 
 // watchOwnPods 监听自身Pod的变化，以更新维护模式下的IP列表
 func watchOwnPods() {
-	// 创建ListWatch，过滤条件为当前命名空间下label为"app=traffic-switcher"的Pod
-	// 这里使用 fields.Everything() 作为 PodListOptions 的 FieldSelector 是不准确的，
-	// 应该使用 label selector。但在 NewListWatchFromClient 中，FieldSelector 是用于选择资源的字段，
-	// 而 LabelSelector 通常在 ListOptions 中使用。这里结合 informer 的设计，通常不需要直接在 ListWatch 中设置过细的 LabelSelector，
-	// 而是在后续的 ListOptions 中应用。
 	listWatch := cache.NewListWatchFromClient(
 		clientset.CoreV1().RESTClient(),
 		"pods",
 		programNamespace,
-		fields.Everything(), // 这里的 fields.Everything() 是可以的，因为 LabelSelector 会在 ListOptions 中应用
+		fields.Everything(),
 	)
 
 	// 创建Informer，监听Pod的Add/Update/Delete事件
@@ -616,6 +625,7 @@ func monitorRule(ctx context.Context, rule Rule) {
 					healthy = true
 					break
 				}
+				logger.Debug("URL probe retry", zap.String("domain", rule.Domain), zap.String("url", rule.CheckURL), zap.Int("attempt", i+1))
 				time.Sleep(1 * time.Second) // 重试间隔
 			}
 
@@ -687,11 +697,28 @@ func monitorRule(ctx context.Context, rule Rule) {
 						recoveryMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.RecoveryMessage, rule.Domain)
 						recoveryMsg := tgbotapi.NewMessage(telegramChatID, recoveryMsgText)
 						recoveryMsg.ParseMode = "Markdown"
-						_, sendErr := appConfig.Send(recoveryMsg)
+						
+						// 发送恢复消息，并增加重试逻辑
+						_, sendErr := appBotApi.Send(recoveryMsg)
 						if sendErr != nil {
-							logger.Error("Failed to send Telegram recovery message.", zap.Error(sendErr), zap.String("domain", rule.Domain))
+							logger.Error("Initial Telegram recovery message send failed, retrying...", zap.Error(sendErr), zap.String("domain", rule.Domain))
+							retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+								_, innerSendErr := appBotApi.Send(recoveryMsg)
+								if innerSendErr != nil {
+									logger.Warn("Telegram recovery message retry failed", zap.Error(innerSendErr), zap.String("domain", rule.Domain))
+									return false, nil
+								}
+								return true, nil
+							})
+							if retryErr != nil && retryErr != context.DeadlineExceeded {
+								logger.Error("Failed to send Telegram recovery message after retries", zap.Error(retryErr), zap.String("domain", rule.Domain))
+							} else if retryErr == context.DeadlineExceeded {
+								logger.Warn("Telegram recovery message send timed out after retries", zap.String("domain", rule.Domain))
+							} else {
+								logger.Info("Telegram recovery message sent successfully after retries", zap.String("domain", rule.Domain), zap.String("message", recoveryMsgText))
+							}
 						} else {
-							logger.Info("Telegram recovery message sent.", zap.String("domain", rule.Domain), zap.String("message", recoveryMsgText))
+							logger.Info("Telegram recovery message sent immediately", zap.String("domain", rule.Domain), zap.String("message", recoveryMsgText))
 						}
 					}
 				}
@@ -730,11 +757,29 @@ func sendTelegramNotification(domain string) {
 	msg := tgbotapi.NewMessage(telegramChatID, notificationText)
 	msg.ParseMode = "Markdown" // 启用Markdown格式
 
-	_, err := appConfig.Send(msg) // 使用全局bot实例
+	// 初始发送尝试
+	_, err := appBotApi.Send(msg) // 使用全局bot实例
 	if err != nil {
-		logger.Error("Failed to send Telegram notification after multiple retries", zap.Error(err), zap.String("domain", domain), zap.String("message", notificationText))
+		logger.Error("Initial Telegram notification send failed, retrying...", zap.Error(err), zap.String("domain", domain), zap.String("message", notificationText))
+		// Re-add Retry logic using wait.PollUntilContextTimeout
+		retryErr := wait.PollUntilContextTimeout(context.Background(), 5*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
+			_, sendErr := appBotApi.Send(msg)
+			if sendErr != nil {
+				logger.Warn("Telegram notification retry failed", zap.Error(sendErr), zap.String("domain", domain))
+				return false, nil // Keep retrying
+			}
+			return true, nil // Success
+		})
+
+		if retryErr != nil && retryErr != context.DeadlineExceeded {
+			logger.Error("Failed to send Telegram notification after retries", zap.Error(retryErr), zap.String("domain", domain))
+		} else if retryErr == context.DeadlineExceeded {
+			logger.Error("Telegram notification send timed out after retries", zap.String("domain", domain))
+		} else {
+			logger.Info("Telegram notification sent successfully after retries", zap.String("domain", domain), zap.String("message", notificationText))
+		}
 	} else {
-		logger.Info("Telegram notification sent", zap.String("domain", domain), zap.String("message", notificationText))
+		logger.Info("Telegram notification sent immediately", zap.String("domain", domain), zap.String("message", notificationText))
 	}
 }
 
@@ -770,7 +815,7 @@ func telegramCallbackHandler(w http.ResponseWriter, r *http.Request) {
 				logger.Info("Traffic switch confirmed by Telegram user", zap.String("domain", domain), zap.String("user", update.Message.From.UserName))
 				replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ConfirmReply, domain)
 				// 立即触发一次切换，而不是等待下一个监控周期
-				if state.Status == "failed" { // 只有在已检测到故障时才立即切换
+				if state.Status != "failed" { // 只有在已检测到故障时才立即切换
 					mu.RLock()
 					currentRules := rules
 					mu.RUnlock()
@@ -814,15 +859,30 @@ func telegramCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		replyText = "Hello! I am Traffic Switcher bot. You can interact with me to manage traffic for your domains. Try `/confirm_yourdomain` or `/manual_yourdomain`."
 	}
 
-	// 回复Telegram用户
+	// 回复Telegram用户，并增加重试逻辑
 	if replyText != "" {
 		replyMsg := tgbotapi.NewMessage(chatID, replyText)
 		replyMsg.ParseMode = "Markdown"
-		_, err := appConfig.Send(replyMsg) // 使用全局bot实例
+		_, err := appBotApi.Send(replyMsg) // 使用全局bot实例
 		if err != nil {
-			logger.Error("Failed to send Telegram reply message", zap.Error(err), zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
+			logger.Error("Initial Telegram reply send failed, retrying...", zap.Error(err), zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
+			retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+				_, sendErr := appBotApi.Send(replyMsg)
+				if sendErr != nil {
+					logger.Warn("Telegram reply retry failed", zap.Error(sendErr), zap.Int64("chat_id", chatID))
+					return false, nil // Keep retrying
+				}
+				return true, nil // Success
+			})
+			if retryErr != nil && retryErr != context.DeadlineExceeded {
+				logger.Error("Failed to send Telegram reply after retries", zap.Error(retryErr), zap.Int64("chat_id", chatID))
+			} else if retryErr == context.DeadlineExceeded {
+				logger.Warn("Telegram reply send timed out after retries", zap.Int64("chat_id", chatID))
+			} else {
+				logger.Info("Telegram reply sent successfully after retries", zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
+			}
 		} else {
-			logger.Info("Telegram reply sent", zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
+			logger.Info("Telegram reply sent immediately", zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
 		}
 	}
 	w.WriteHeader(http.StatusOK) // 总是返回200 OK给Telegram
