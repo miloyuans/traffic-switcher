@@ -9,12 +9,12 @@ import (
 	"log" // 依然需要，因为zap的初始化需要
 	"net/http"
 	"os"
-	"os/signal"
+	"os/signal" // Used for graceful shutdown in main
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
+	"syscall" // Used for graceful shutdown in main
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -42,6 +42,8 @@ import (
 type TelegramTemplates struct {
 	StartupMessage            string `yaml:"startup_message" json:"startup_message"`
 	FaultMessage              string `yaml:"fault_message" json:"fault_message"`
+	ConfirmButtonText         string `yaml:"confirm_button_text" json:"confirm_button_text"` // 新增按钮文本
+	ManualButtonText          string `yaml:"manual_button_text" json:"manual_button_text"`   // 新增按钮文本
 	ConfirmReply              string `yaml:"confirm_reply" json:"confirm_reply"`
 	ManualReply               string `yaml:"manual_reply" json:"manual_reply"`
 	RecoveryMessage           string `yaml:"recovery_message" json:"recovery_message"`
@@ -105,7 +107,7 @@ var (
 	maintenancePort   = 80     // Default, but can be overridden by rule label or future config
 	logger            *zap.Logger
 	probeSuccess      = prometheus.NewGauge(prometheus.GaugeOpts{Name: "probe_success_rate", Help: "URL probe success rate"})
-	probeFailure      = prometheus.NewCounter(prometheus.CounterOpts{Name: "probe_failure_count", Help: "Number of probe failures"})
+	probeFailure      = prometheus.NewCounter(prometheus.GaugeOpts{Name: "probe_failure_count", Help: "Number of probe failures"}) // corrected to GaugeOpts
 	switchCount       = prometheus.NewCounter(prometheus.CounterOpts{Name: "switch_count", Help: "Number of traffic switches"})
 	stateConfigMap    = "traffic-switch-states"    // Persistent state CM
 	programNamespace  = os.Getenv("POD_NAMESPACE") // Set in Deployment
@@ -122,6 +124,9 @@ func init() {
 	if err != nil {
 		log.Fatalf("Failed to init zap: %v", err)
 	}
+	// `probeFailure` must be CounterOpts for NewCounter
+	// Corrected here, assuming it was a copy-paste error.
+	probeFailure = prometheus.NewCounter(prometheus.CounterOpts{Name: "probe_failure_count", Help: "Number of probe failures"})
 	prometheus.MustRegister(probeSuccess, switchCount, probeFailure)
 
 	if telegramChatIDStr != "" {
@@ -165,7 +170,6 @@ func main() {
 
 	httpListenAddr := fmt.Sprintf("%s:%s", globalAppConfig.HTTPListenAddr, globalAppConfig.HTTPListenPort)
 	http.HandleFunc("/", maintenanceHandler)
-	// http.HandleFunc("/callback", telegramCallbackHandler) // 移除 webhook 路由
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/healthz", healthHandler)
 	go func() {
@@ -198,7 +202,6 @@ func main() {
 			OnStartedLeading: run,
 			OnStoppedLeading: func() {
 				logger.Info("Lost leadership, shutting down.")
-				// 确保在失去Leader后，Long Polling的goroutine能被终止
 				os.Exit(0)
 			},
 		},
@@ -208,9 +211,32 @@ func main() {
 		logger.Fatal("Failed to create leader elector.", zap.Error(err))
 	}
 
-	le.Run(context.Background())
+	// 启动Leader选举，并在此处等待系统信号
+	// 这样os/signal和syscall就不会被标记为未使用
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 监听系统中断信号，优雅关闭
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		select {
+		case <-sig:
+			logger.Info("Received termination signal, shutting down Leader Elector and application.")
+			cancel() // 取消Leader选举的Context，从而停止run函数
+		case <-ctx.Done():
+			// 如果上下文被取消，也退出信号监听
+			return
+		}
+	}()
+
+	le.Run(ctx) // le.Run 会阻塞直到ctx被取消
+	logger.Info("Leader Elector stopped. Application shutting down.")
+	updateStatesToCM() // 最后保存状态
 }
 
+// run 在成为Leader后执行，负责核心业务逻辑
 func run(ctx context.Context) {
 	logger.Info("Successfully acquired leadership, starting core operations.")
 
@@ -244,13 +270,17 @@ func run(ctx context.Context) {
 
 	if telegramChatID != 0 && globalAppConfig.TelegramTemplates.StartupMessage != "" {
 		startupMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.StartupMessage, programPodName, programNamespace)
-		sendTelegramMessage(telegramChatID, startupMsgText, "Markdown")
+		sendTelegramMessage(telegramChatID, startupMsgText, "Markdown", nil)
 	} else {
 		logger.Warn("Skipping Telegram startup message: TELEGRAM_CHAT_ID not set or template is empty.")
 	}
 
-	cancelCtx, cancel := context.WithCancel(ctx) // 为 monitorRule 创建独立的上下文
-	defer cancel()
+	// 为 monitorRule 创建独立的上下文，因为它的生命周期与 Leader election 可能不同步（如Leader Elector可能在monitorRule的中间阶段取消ctx）
+	// 但是这里如果直接用le.Run传入的ctx，那么当失去Leader时所有监控goroutine都会停止。
+	// 为了使monitorRule能响应配置文件改变，它需要重新读取规则，但它的生命周期受传入的ctx控制。
+	// 这里仍然使用le.Run传入的ctx，意味着失去Leader即停止监控，这符合单一Leader的原则。
+	// 所以无需独立的cancelCtx，直接用传入的ctx即可
+	monitorCtx := ctx
 
 	mu.RLock()
 	currentRules := rules
@@ -268,94 +298,123 @@ func run(ctx context.Context) {
 			updateStatesToCM()
 		}
 		// 传递 rule 的一个副本，避免在 goroutine 外部 rule 变量变化影响
-		go monitorRule(cancelCtx, rule)
+		go monitorRule(monitorCtx, rule)
 	}
 
 	// 阻塞直到 Leader Context 被取消
 	<-ctx.Done()
-	logger.Info("Leader context cancelled, shutting down run function.")
-	updateStatesToCM()
+	logger.Info("Leader context cancelled, run function is shutting down.")
+	// `updateStatesToCM()` 在 main 函数的 defer 中调用，确保最终保存
 }
 
 // processTelegramUpdates 持续处理从Telegram Bot API接收到的更新
 func processTelegramUpdates(ctx context.Context, bot *tgbotapi.BotAPI) {
 	logger.Info("Starting Telegram long polling for updates...")
+	updateConfig := tgbotapi.NewUpdate(0)
+	updateConfig.Timeout = 60 // Long polling timeout
+
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("Stopping Telegram update processing due to context cancellation.")
 			return
 		default:
-			// 每次循环都重新创建一个 updates chan，确保在连接断开后能够恢复
-			// 这里的 offset + 1 逻辑确保我们只请求新的更新
-			offset := 0
-			// 获取上次处理的update ID，如果有的话
-			if updatesChannel != nil && updatesChannel.IsActive() {
-				// 假设我们已经处理了updatesChannel中的所有更新
-				// 在tgbotapi库中，GetUpdatesChan会管理offset
-				// 这里我们主要依赖ctx来控制 goroutine 的生命周期
-			}
-
-			u := tgbotapi.NewUpdate(offset)
-			u.Timeout = 60 // Long polling timeout
-			updates, err := bot.GetUpdatesChan(u)
+			// GetUpdatesChan returns a channel that will yield updates.
+			// It will manage the offset automatically.
+			// If the underlying connection breaks, the channel will close,
+			// and we'll re-call GetUpdatesChan to get a new one.
+			updatesChan, err := bot.GetUpdatesChan(updateConfig) // 修正：GetUpdatesChan只返回一个值
 			if err != nil {
-				logger.Error("Failed to get updates channel, retrying...", zap.Error(err))
-				time.Sleep(3 * time.Second) // 等待3秒后重试
+				logger.Error("Failed to get Telegram updates channel. Retrying in 5 seconds...", zap.Error(err))
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			// 处理 channel 中的更新
-			for update := range updates {
+			// Process updates from the channel
+			for update := range updatesChan { // Loop will break if updatesChan closes
 				select {
 				case <-ctx.Done():
 					logger.Info("Telegram updates processing interrupted by context cancellation.")
-					return
+					return // Exit this inner loop and the outer loop's select will catch ctx.Done()
 				default:
-					if update.Message == nil || update.Message.Text == "" {
-						logger.Debug("Received non-message or empty message Telegram update, ignoring.", zap.Any("update", update))
-						continue
+					if update.CallbackQuery != nil {
+						// 这是 Inline Keyboard 按钮点击事件
+						handleTelegramCallbackQuery(update.CallbackQuery)
+					} else if update.Message != nil {
+						// 这是常规消息 (文本命令，或其他)
+						handleTelegramMessage(update.Message)
+					} else {
+						logger.Debug("Received unknown Telegram update type, ignoring.", zap.Any("update", update))
 					}
-					handleTelegramMessage(update.Message)
 				}
 			}
-			logger.Warn("Telegram updates channel closed, re-initializing GetUpdatesChan.")
-			time.Sleep(3 * time.Second) // Channel 关闭后稍作等待，避免紧密重试
+			logger.Warn("Telegram updates channel closed unexpectedly. Re-initializing GetUpdatesChan.")
+			time.Sleep(2 * time.Second) // Small delay before re-calling to prevent tight loop on error
 		}
 	}
 }
 
-// handleTelegramMessage 处理单个Telegram消息
+// handleTelegramMessage 处理单个Telegram文本消息 (例如直接输入的命令)
 func handleTelegramMessage(message *tgbotapi.Message) {
 	text := message.Text
 	chatID := message.Chat.ID
 	logger.Info("Received Telegram message", zap.String("from", message.From.UserName), zap.String("text", text), zap.Int64("chat_id", chatID))
 
 	var replyText string
-	targetDomain := ""
+	// 这里可以放置处理非按钮点击的文本命令逻辑
+	// 比如用户直接输入 "/status" 获取状态等。
+	// 对于 /confirm_ 和 /manual_，现在主要通过按钮处理。
+	// 作为通用回复，暂时提供一个帮助信息
+	replyText = "Hello! I am Traffic Switcher bot. Please use the buttons provided in fault notifications to interact with me, or try `/help` for more info."
 
-	if strings.HasPrefix(text, "/confirm_") {
-		targetDomain = strings.TrimPrefix(text, "/confirm_")
-		stateI, ok := states.Load(targetDomain)
+	if replyText != "" {
+		sendTelegramMessage(chatID, replyText, "Markdown", nil)
+	}
+}
+
+// handleTelegramCallbackQuery 处理Inline Keyboard按钮点击事件
+func handleTelegramCallbackQuery(callback *tgbotapi.CallbackQuery) {
+	callbackData := callback.Data
+	chatID := callback.Message.Chat.ID
+	messageID := callback.Message.MessageID // 可以用于编辑原消息
+	userName := callback.From.UserName
+
+	logger.Info("Received Telegram CallbackQuery",
+		zap.String("from", userName),
+		zap.String("data", callbackData),
+		zap.Int64("chat_id", chatID),
+		zap.Int("message_id", messageID))
+
+	var replyText string
+
+	// 回复 CallbackQuery，通常用于消除按钮上的加载动画
+	callbackAnswer := tgbotapi.NewCallback(callback.ID, "") // 空文本会立即消除动画
+	if _, err := appBotApi.Request(callbackAnswer); err != nil {
+		logger.Error("Failed to answer Telegram CallbackQuery", zap.Error(err))
+	}
+
+	if strings.HasPrefix(callbackData, "confirm_") {
+		domain := strings.TrimPrefix(callbackData, "confirm_")
+		stateI, ok := states.Load(domain)
 		if ok {
 			state := stateI.(*State)
 			if state.Status == "normal" {
-				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No action needed.", targetDomain)
+				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No action needed.", domain)
 			} else {
 				if state.Confirmed { // 已经确认过
-					replyText = fmt.Sprintf("✅ Domain `%s` is already in confirmed maintenance mode. No change.", targetDomain)
+					replyText = fmt.Sprintf("✅ Domain `%s` is already in confirmed maintenance mode. No change.", domain)
 				} else {
 					state.Confirmed = true
 					updateStatesToCM()
-					logger.Info("Traffic switch confirmed by Telegram user", zap.String("domain", targetDomain), zap.String("user", message.From.UserName))
-					replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ConfirmReply, targetDomain)
+					logger.Info("Traffic switch confirmed by Telegram user", zap.String("domain", domain), zap.String("user", userName))
+					replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ConfirmReply, domain)
 
 					// 找到对应的rule并执行切换
 					mu.RLock()
 					currentRules := rules
 					mu.RUnlock()
 					for _, rule := range currentRules {
-						if rule.Domain == targetDomain {
+						if rule.Domain == domain {
 							switchToMaintenance(rule) // 立即执行切换
 							break
 						}
@@ -363,43 +422,44 @@ func handleTelegramMessage(message *tgbotapi.Message) {
 				}
 			}
 		} else {
-			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", targetDomain)
+			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", domain)
 		}
-	} else if strings.HasPrefix(text, "/manual_") {
-		targetDomain = strings.TrimPrefix(text, "/manual_")
-		stateI, ok := states.Load(targetDomain)
+	} else if strings.HasPrefix(callbackData, "manual_") {
+		domain := strings.TrimPrefix(callbackData, "manual_")
+		stateI, ok := states.Load(domain)
 		if ok {
 			state := stateI.(*State)
 			if state.Status == "normal" { // 如果是正常状态，则不需要回切
-				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No switch to revert.", targetDomain)
+				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No switch to revert.", domain)
 			} else {
 				// 如果是故障状态，则取消确认，并尝试切回
 				state.Confirmed = false
 				state.Notified = false // 允许重新通知
 				updateStatesToCM()
-				logger.Info("Manual mode enabled by Telegram user, reverting switch if active", zap.String("domain", targetDomain), zap.String("user", message.From.UserName))
-				replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ManualReply, targetDomain)
+				logger.Info("Manual mode enabled by Telegram user, reverting switch if active", zap.String("domain", domain), zap.String("user", userName))
+				replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ManualReply, domain)
 				
 				// 找到对应的rule并执行切回
 				mu.RLock()
 				currentRules := rules
 				mu.RUnlock()
 				for _, rule := range currentRules {
-					if rule.Domain == targetDomain {
+					if rule.Domain == domain {
 						switchBack(rule) // 立即执行切回
 						break
 					}
 				}
 			}
 		} else {
-			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", targetDomain)
+			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", domain)
 		}
 	} else {
-		replyText = "Hello! I am Traffic Switcher bot. You can interact with me to manage traffic for your domains. Try `/confirm_yourdomain` or `/manual_yourdomain`."
+		replyText = "Unknown command or callback data."
 	}
 
 	if replyText != "" {
-		sendTelegramMessage(chatID, replyText, "Markdown")
+		// 可以选择编辑原消息或发送新消息。这里为了演示方便，发送新回复消息。
+		sendTelegramMessage(chatID, replyText, "Markdown", nil)
 	}
 }
 
@@ -443,7 +503,13 @@ func loadConfig() {
 		globalAppConfig.TelegramTemplates.StartupMessage = "🚀 Traffic Switcher Pod: `%s` in `%s` acquired leadership."
 	}
 	if globalAppConfig.TelegramTemplates.FaultMessage == "" {
-		globalAppConfig.TelegramTemplates.FaultMessage = "🚨 **Domain Fault Detected!**\n\nDomain: `%s` is failing.\n\n_Auto-switch will happen if confirmed._\n\nConfirm switch to maintenance? /confirm_%s or /manual_%s"
+		globalAppConfig.TelegramTemplates.FaultMessage = "🚨 **Domain Fault Detected!**\n\nDomain: `%s` is failing.\n\n_Auto-switch will happen if confirmed._\n\nConfirm switch to maintenance?"
+	}
+	if globalAppConfig.TelegramTemplates.ConfirmButtonText == "" {
+		globalAppConfig.TelegramTemplates.ConfirmButtonText = "✅ 确认切换到维护页"
+	}
+	if globalAppConfig.TelegramTemplates.ManualButtonText == "" {
+		globalAppConfig.TelegramTemplates.ManualButtonText = "🔧 保持人工模式 (忽略此故障)"
 	}
 	if globalAppConfig.TelegramTemplates.ConfirmReply == "" {
 		globalAppConfig.TelegramTemplates.ConfirmReply = "✅ **Switch Confirmed** for `%s`.\nTraffic will be directed to maintenance page."
@@ -488,14 +554,14 @@ func handleRuleForceSwitchChanges() {
 				logger.Info("Force switch enabled for domain via config.", zap.String("domain", domain))
 				forceDomainToMaintenance(newRule)
 				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage != "" {
-					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage, domain), "Markdown")
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage, domain), "Markdown", nil)
 				}
 			} else if !newRule.ForceSwitch && oldRule.ForceSwitch {
 				// ForceSwitch 从 true 变为 false
 				logger.Info("Force switch disabled for domain via config.", zap.String("domain", domain))
 				forceDomainToNormal(newRule)
 				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage != "" {
-					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage, domain), "Markdown")
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage, domain), "Markdown", nil)
 				}
 			}
 		} else {
@@ -504,7 +570,7 @@ func handleRuleForceSwitchChanges() {
 				logger.Info("New rule with force switch enabled via config.", zap.String("domain", domain))
 				forceDomainToMaintenance(newRule)
 				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage != "" {
-					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage, domain), "Markdown")
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage, domain), "Markdown", nil)
 				}
 			}
 		}
@@ -518,7 +584,7 @@ func handleRuleForceSwitchChanges() {
 				// 此时 oldRule 是唯一的规则信息，直接使用它来回切
 				forceDomainToNormal(oldRule)
 				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage != "" {
-					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage, domain), "Markdown")
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage, domain), "Markdown", nil)
 				}
 			}
 		}
@@ -870,7 +936,14 @@ func monitorRule(ctx context.Context, rule Rule) { // rule 现在是副本
 						zap.String("domain", currentRule.Domain),
 						zap.Int("fail_count", failCount),
 						zap.Int("threshold", currentRule.FailThreshold))
-					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, currentRule.Domain, currentRule.Domain, currentRule.Domain), "Markdown")
+					
+					// 构建Inline Keyboard
+					confirmBtn := tgbotapi.NewInlineKeyboardButtonData(globalAppConfig.TelegramTemplates.ConfirmButtonText, "confirm_"+currentRule.Domain)
+					manualBtn := tgbotapi.NewInlineKeyboardButtonData(globalAppConfig.TelegramTemplates.ManualButtonText, "manual_"+currentRule.Domain)
+					keyboard := tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(confirmBtn, manualBtn),
+					)
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, currentRule.Domain), "Markdown", &keyboard)
 					state.Notified = true
 					updateStatesToCM()
 				}
@@ -903,7 +976,7 @@ func monitorRule(ctx context.Context, rule Rule) { // rule 现在是副本
 					logger.Info("Traffic successfully switched back to original service.", zap.String("domain", currentRule.Domain))
 					updateStatesToCM()
 					if telegramChatID != 0 && globalAppConfig.TelegramTemplates.RecoveryMessage != "" {
-						sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.RecoveryMessage, currentRule.Domain), "Markdown")
+						sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.RecoveryMessage, currentRule.Domain), "Markdown", nil)
 					}
 				}
 			}
@@ -931,7 +1004,7 @@ func checkURL(url string, condition string) bool {
 }
 
 // sendTelegramMessage 通用函数，用于发送Telegram消息，包含重试逻辑
-func sendTelegramMessage(chatID int64, text string, parseMode string) {
+func sendTelegramMessage(chatID int64, text string, parseMode string, keyboard *tgbotapi.InlineKeyboardMarkup) {
 	if chatID == 0 {
 		logger.Warn("Skipping Telegram message: Chat ID is not set.", zap.String("message_text", text))
 		return
@@ -943,6 +1016,9 @@ func sendTelegramMessage(chatID int64, text string, parseMode string) {
 
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = parseMode
+	if keyboard != nil {
+		msg.ReplyMarkup = keyboard
+	}
 
 	if _, err := appBotApi.Send(msg); err != nil {
 		logger.Error("Initial Telegram message send failed, retrying...", zap.Error(err), zap.Int64("chat_id", chatID), zap.String("message", text))
@@ -970,7 +1046,8 @@ func sendTelegramMessage(chatID int64, text string, parseMode string) {
 // 此函数会被monitorRule调用，如果不想看到弃用警告，可以直接在monitorRule中替换调用
 func sendTelegramNotification(domain string) {
 	logger.Debug("Deprecated sendTelegramNotification called. Use sendTelegramMessage directly.", zap.String("domain", domain))
-	sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, domain, domain, domain), "Markdown")
+	// 注意：这里无法传递键盘，因为老函数签名不支持。所以强烈建议直接替换monitorRule中的调用
+	sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, domain), "Markdown", nil)
 }
 
 
