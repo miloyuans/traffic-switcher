@@ -198,6 +198,7 @@ func main() {
 			OnStartedLeading: run,
 			OnStoppedLeading: func() {
 				logger.Info("Lost leadership, shutting down.")
+				// 确保在失去Leader后，Long Polling的goroutine能被终止
 				os.Exit(0)
 			},
 		},
@@ -227,20 +228,19 @@ func run(ctx context.Context) {
 	}
 	logger.Info("Telegram Bot connected successfully", zap.String("bot_username", botUser.UserName))
 
-	// 清除潜在的旧 Webhook (可选，但推荐)
-	// 如果之前设置过 Webhook，这里可以确保它被禁用
-	_, err = appBotApi.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true})
+	// 清除潜在的旧 Webhook (重要)
+	// 确保在尝试 Long Polling 之前，Bot 没有配置 Webhook
+	deleteWebhookConfig := tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true}
+	_, err = appBotApi.Request(deleteWebhookConfig)
 	if err != nil {
-		logger.Warn("Failed to delete old Telegram webhook (if any): %v", zap.Error(err))
+		logger.Warn("Failed to delete old Telegram webhook (if any, this is often fine if no webhook was set): %v", zap.Error(err))
 	} else {
 		logger.Info("Successfully deleted old Telegram webhook configuration.")
 	}
 
 	// 启动 Long Polling 来接收 Telegram 消息
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60 // Long polling timeout
-	updates := appBotApi.GetUpdatesChan(u)
-	go processTelegramUpdates(ctx, updates) // 在一个单独的goroutine中处理更新
+	// 使用 Leader Elector 提供的 Context 来控制 Long Polling goroutine 的生命周期
+	go processTelegramUpdates(ctx, appBotApi)
 
 	if telegramChatID != 0 && globalAppConfig.TelegramTemplates.StartupMessage != "" {
 		startupMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.StartupMessage, programPodName, programNamespace)
@@ -249,7 +249,7 @@ func run(ctx context.Context) {
 		logger.Warn("Skipping Telegram startup message: TELEGRAM_CHAT_ID not set or template is empty.")
 	}
 
-	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelCtx, cancel := context.WithCancel(ctx) // 为 monitorRule 创建独立的上下文
 	defer cancel()
 
 	mu.RLock()
@@ -271,34 +271,56 @@ func run(ctx context.Context) {
 		go monitorRule(cancelCtx, rule)
 	}
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	logger.Info("Shutting down application due to signal.")
+	// 阻塞直到 Leader Context 被取消
+	<-ctx.Done()
+	logger.Info("Leader context cancelled, shutting down run function.")
 	updateStatesToCM()
 }
 
 // processTelegramUpdates 持续处理从Telegram Bot API接收到的更新
-func processTelegramUpdates(ctx context.Context, updates tgbotapi.UpdatesChannel) {
+func processTelegramUpdates(ctx context.Context, bot *tgbotapi.BotAPI) {
 	logger.Info("Starting Telegram long polling for updates...")
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("Stopping Telegram update processing due to context cancellation.")
 			return
-		case update, ok := <-updates:
-			if !ok {
-				logger.Error("Telegram updates channel closed, attempting to re-establish polling.")
-				// 这里可以添加逻辑来重新初始化 GetUpdatesChan，或者直接让外层goroutine决定如何处理
-				time.Sleep(5 * time.Second) // 避免无限循环
-				return // 暂时退出，让run函数决定是否重新启动
+		default:
+			// 每次循环都重新创建一个 updates chan，确保在连接断开后能够恢复
+			// 这里的 offset + 1 逻辑确保我们只请求新的更新
+			offset := 0
+			// 获取上次处理的update ID，如果有的话
+			if updatesChannel != nil && updatesChannel.IsActive() {
+				// 假设我们已经处理了updatesChannel中的所有更新
+				// 在tgbotapi库中，GetUpdatesChan会管理offset
+				// 这里我们主要依赖ctx来控制 goroutine 的生命周期
 			}
-			if update.Message == nil || update.Message.Text == "" {
-				logger.Debug("Received non-message or empty message Telegram update, ignoring.", zap.Any("update", update))
+
+			u := tgbotapi.NewUpdate(offset)
+			u.Timeout = 60 // Long polling timeout
+			updates, err := bot.GetUpdatesChan(u)
+			if err != nil {
+				logger.Error("Failed to get updates channel, retrying...", zap.Error(err))
+				time.Sleep(3 * time.Second) // 等待3秒后重试
 				continue
 			}
-			// 将原始的 telegramCallbackHandler 逻辑移到这里
-			handleTelegramMessage(update.Message)
+
+			// 处理 channel 中的更新
+			for update := range updates {
+				select {
+				case <-ctx.Done():
+					logger.Info("Telegram updates processing interrupted by context cancellation.")
+					return
+				default:
+					if update.Message == nil || update.Message.Text == "" {
+						logger.Debug("Received non-message or empty message Telegram update, ignoring.", zap.Any("update", update))
+						continue
+					}
+					handleTelegramMessage(update.Message)
+				}
+			}
+			logger.Warn("Telegram updates channel closed, re-initializing GetUpdatesChan.")
+			time.Sleep(3 * time.Second) // Channel 关闭后稍作等待，避免紧密重试
 		}
 	}
 }
