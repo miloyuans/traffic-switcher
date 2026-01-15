@@ -560,18 +560,27 @@ func switchBack(rule Rule) {
 	updateStatesToCM()
 }
 
-func maintenanceHandler(w http.ResponseWriter, r *http.ResponseWriter) {
-	mu.RLock()
-	tmpl := htmlTemplate
-	mu.RUnlock()
-	if tmpl == nil {
-		http.Error(w, "No template", http.StatusInternalServerError)
-		return
-	}
-	err := tmpl.Execute(w, map[string]string{"Domain": r.Host})
-	if err != nil {
-		logger.Error("Render HTML failed", zap.Error(err))
-	}
+func maintenanceHandler(w http.ResponseWriter, r *http.Request) {
+    mu.RLock()
+    tmpl := htmlTemplate
+    mu.RUnlock()
+
+    if tmpl == nil {
+        http.Error(w, "Maintenance page template not loaded", http.StatusInternalServerError)
+        return
+    }
+
+    data := map[string]string{
+        "Domain": r.Host,
+    }
+
+    if err := tmpl.Execute(w, data); err != nil {
+        logger.Error("Failed to render maintenance page",
+            zap.String("host", r.Host),
+            zap.Error(err))
+        http.Error(w, "Failed to render maintenance page", http.StatusInternalServerError)
+        return
+    }
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
