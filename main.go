@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -23,7 +22,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -36,8 +34,6 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog/v2"
-	"k8s.io/utils/pointer"
 )
 
 type Rule struct {
@@ -145,7 +141,8 @@ func main() {
 	go watchConfigFile()
 
 	// Leader election
-	rl, err := resourcelock.New(resourcelock.LeasesLock,
+	rl, err := resourcelock.New(resourcelock.LeasesResourceLock,
+	//	rl, err := resourcelock.New(resourcelock.LeasesLock,
 		programNamespace,
 		leaderLeaseName,
 		clientset.CoreV1(),
@@ -208,7 +205,8 @@ func run(ctx context.Context) {
 }
 
 func loadConfig() {
-	data, err := ioutil.ReadFile(configPath)
+	//data, err := ioutil.ReadFile(configPath)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		logger.Error("Read config failed", zap.Error(err))
 		return
@@ -350,7 +348,7 @@ func watchOwnPods() {
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(stop)
-	wait.Forever()
+	select {}
 }
 
 func updatePodIPs() {
