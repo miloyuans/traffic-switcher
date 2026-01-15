@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,9 +21,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
 )
 
 type Rule struct {
@@ -66,7 +67,7 @@ var (
 	configPath        = "/config/rules.yaml"
 	htmlPath          = "/config/maintenance.html"
 	telegramToken     = os.Getenv("TELEGRAM_BOT_TOKEN")
-	telegramChatIDStr = os.Getenv("TELEGRAM_CHAT_ID")
+	telegramChatIDStr = os.Getenv("TELEGRAM_CHAT_ID"
 	telegramChatID    int64
 	rules             []Rule
 	states            sync.Map // domain -> *State
@@ -78,6 +79,7 @@ var (
 	maintenancePort   = 80
 	logger            *zap.Logger
 	probeSuccess      = prometheus.NewGauge(prometheus.GaugeOpts{Name: "probe_success_rate", Help: "URL probe success rate"})
+	probeFailure      = prometheus.NewCounter(prometheus.CounterOpts{Name: "probe_failure_count", Help: "Number of probe failures"})
 	switchCount       = prometheus.NewCounter(prometheus.CounterOpts{Name: "switch_count", Help: "Number of traffic switches"})
 	stateConfigMap    = "traffic-switch-states" // Persistent state CM
 	programNamespace  = os.Getenv("POD_NAMESPACE") // Set in Deployment
@@ -91,7 +93,7 @@ func init() {
 	if err != nil {
 		log.Fatalf("Failed to init zap: %v", err)
 	}
-	prometheus.MustRegister(probeSuccess, switchCount)
+	prometheus.MustRegister(probeSuccess, switchCount, probeFailure)
 	if telegramChatIDStr != "" {
 		telegramChatID, err = strconv.ParseInt(telegramChatIDStr, 10, 64)
 		if err != nil {
@@ -142,7 +144,6 @@ func main() {
 
 	// Leader election
 	rl, err := resourcelock.New(resourcelock.LeasesResourceLock,
-	//	rl, err := resourcelock.New(resourcelock.LeasesLock,
 		programNamespace,
 		leaderLeaseName,
 		clientset.CoreV1(),
@@ -205,7 +206,6 @@ func run(ctx context.Context) {
 }
 
 func loadConfig() {
-	//data, err := ioutil.ReadFile(configPath)
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		logger.Error("Read config failed", zap.Error(err))
@@ -331,7 +331,7 @@ func watchOwnPods() {
 		clientset.CoreV1().RESTClient(),
 		"pods",
 		programNamespace,
-		fields.SelectorFromSet(fields.Set{"metadata.labels.app": "traffic-switcher"}),
+		fields.Everything(),
 	)
 
 	_, controller := cache.NewInformer(
@@ -353,7 +353,7 @@ func watchOwnPods() {
 
 func updatePodIPs() {
 	pods, err := clientset.CoreV1().Pods(programNamespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: "app=traffic-switcher",
+		LabelSelector: labels.SelectorFromSet(labels.Set{"app": "traffic-switcher"}).String(),
 	})
 	if err != nil {
 		logger.Error("List pods failed", zap.Error(err))
@@ -379,7 +379,10 @@ func updatePodIPs() {
 
 func rePatchSwitchedSvcs() {
 	for _, rule := range rules {
-		stateI, _ := states.Load(rule.Domain)
+		stateI, ok := states.Load(rule.Domain)
+		if !ok {
+			continue
+		}
 		state := stateI.(*State)
 		if state.Status == "failed" && state.Confirmed {
 			switchToMaintenance(rule)
@@ -403,11 +406,21 @@ func monitorRule(ctx context.Context, bot *tgbotapi.BotAPI, rule Rule) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			healthy := checkURL(rule.CheckURL, rule.CheckCondition)
-			probeSuccess.Set(func() float64 { if healthy { return 1 }; return 0 }())
-			//probeSuccess.Set(func() float64 { if healthy { return 1 } return 0 }())
+			healthy := false
+			retry.BackoffUntil(func() {
+				healthy = checkURL(rule.CheckURL, rule.CheckCondition)
+			}, retry.NewBackoff(), 3, time.Second)
+			if healthy {
+				probeSuccess.Set(1)
+			} else {
+				probeFailure.Inc()
+				probeSuccess.Set(0)
+			}
 
-			stateI, _ := states.Load(rule.Domain)
+			stateI, ok := states.Load(rule.Domain)
+			if !ok {
+				continue
+			}
 			state := stateI.(*State)
 
 			if !healthy {

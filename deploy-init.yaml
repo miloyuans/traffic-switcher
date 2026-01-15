@@ -1,0 +1,163 @@
+# traffic-switcher-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traffic-switcher-sa
+  namespace: monitoring  # 或您的 namespace
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: traffic-switcher-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "endpoints", "configmaps"]
+  verbs: ["get", "list", "watch", "patch", "create", "update"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update", "delete"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: traffic-switcher-binding
+subjects:
+- kind: ServiceAccount
+  name: traffic-switcher-sa
+  namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: traffic-switcher-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# traffic-switcher-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-switch-rules
+  namespace: monitoring
+data:
+  rules.yaml: |
+    {
+      "rules": [
+        {
+          "domain": "example.com",
+          "check_url": "https://example.com/",
+          "check_condition": "200 OK",
+          "fail_threshold": 3,
+          "recovery_threshold": 3,
+          "check_interval": "30s",
+          "maintenance_pod_label": "app=traffic-switcher",
+          "services": [
+            {
+              "namespace": "ns1",
+              "svc_names": ["svc-a", "svc-b"]
+            },
+            {
+              "namespace": "ns2",
+              "svc_names": ["svc-c"]
+            }
+          ]
+        }
+      ]
+    }
+  maintenance.html: |
+    <html>
+    <body>
+    <h1>维护中: {{.Domain}}</h1>
+    <p>请稍后重试。</p>
+    </body>
+    </html>
+---
+# traffic-switcher-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-switcher
+  namespace: monitoring
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: traffic-switcher
+  template:
+    metadata:
+      labels:
+        app: traffic-switcher
+    spec:
+      serviceAccountName: traffic-switcher-sa
+      containers:
+      - name: traffic-switcher
+        image: your-account-id.dkr.ecr.your-region.amazonaws.com/traffic-switcher:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80  # For webhook/metrics/healthz
+        env:
+        - name: TELEGRAM_BOT_TOKEN
+          value: "your-bot-token"  # 最好用 Secret
+        - name: TELEGRAM_CHAT_ID
+          value: "your-chat-id"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: traffic-switch-rules
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - traffic-switcher
+              topologyKey: kubernetes.io/hostname
+---
+# traffic-switcher-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-switcher-svc
+  namespace: monitoring
+spec:
+  selector:
+    app: traffic-switcher
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP  # 或 LoadBalancer if public
