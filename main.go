@@ -107,7 +107,7 @@ var (
 	maintenancePort   = 80     // Default, but can be overridden by rule label or future config
 	logger            *zap.Logger
 	probeSuccess      = prometheus.NewGauge(prometheus.GaugeOpts{Name: "probe_success_rate", Help: "URL probe success rate"})
-	probeFailure      = prometheus.NewCounter(prometheus.GaugeOpts{Name: "probe_failure_count", Help: "Number of probe failures"}) // corrected to GaugeOpts
+	probeFailure      prometheus.Counter // 修正为Counter类型
 	switchCount       = prometheus.NewCounter(prometheus.CounterOpts{Name: "switch_count", Help: "Number of traffic switches"})
 	stateConfigMap    = "traffic-switch-states"    // Persistent state CM
 	programNamespace  = os.Getenv("POD_NAMESPACE") // Set in Deployment
@@ -124,8 +124,7 @@ func init() {
 	if err != nil {
 		log.Fatalf("Failed to init zap: %v", err)
 	}
-	// `probeFailure` must be CounterOpts for NewCounter
-	// Corrected here, assuming it was a copy-paste error.
+	// 修正：使用CounterOpts初始化prometheus.Counter
 	probeFailure = prometheus.NewCounter(prometheus.CounterOpts{Name: "probe_failure_count", Help: "Number of probe failures"})
 	prometheus.MustRegister(probeSuccess, switchCount, probeFailure)
 
@@ -271,15 +270,12 @@ func run(ctx context.Context) {
 	if telegramChatID != 0 && globalAppConfig.TelegramTemplates.StartupMessage != "" {
 		startupMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.StartupMessage, programPodName, programNamespace)
 		sendTelegramMessage(telegramChatID, startupMsgText, "Markdown", nil)
+		logger.Info("Telegram startup message sent.") // Telegram启动加载成功日志
 	} else {
 		logger.Warn("Skipping Telegram startup message: TELEGRAM_CHAT_ID not set or template is empty.")
 	}
 
-	// 为 monitorRule 创建独立的上下文，因为它的生命周期与 Leader election 可能不同步（如Leader Elector可能在monitorRule的中间阶段取消ctx）
-	// 但是这里如果直接用le.Run传入的ctx，那么当失去Leader时所有监控goroutine都会停止。
-	// 为了使monitorRule能响应配置文件改变，它需要重新读取规则，但它的生命周期受传入的ctx控制。
-	// 这里仍然使用le.Run传入的ctx，意味着失去Leader即停止监控，这符合单一Leader的原则。
-	// 所以无需独立的cancelCtx，直接用传入的ctx即可
+	// monitorRule 使用 le.Run 传入的ctx，当失去Leader时所有监控goroutine都会停止
 	monitorCtx := ctx
 
 	mu.RLock()
@@ -304,7 +300,6 @@ func run(ctx context.Context) {
 	// 阻塞直到 Leader Context 被取消
 	<-ctx.Done()
 	logger.Info("Leader context cancelled, run function is shutting down.")
-	// `updateStatesToCM()` 在 main 函数的 defer 中调用，确保最终保存
 }
 
 // processTelegramUpdates 持续处理从Telegram Bot API接收到的更新
@@ -323,13 +318,8 @@ func processTelegramUpdates(ctx context.Context, bot *tgbotapi.BotAPI) {
 			// It will manage the offset automatically.
 			// If the underlying connection breaks, the channel will close,
 			// and we'll re-call GetUpdatesChan to get a new one.
-			updatesChan, err := bot.GetUpdatesChan(updateConfig) // 修正：GetUpdatesChan只返回一个值
-			if err != nil {
-				logger.Error("Failed to get Telegram updates channel. Retrying in 5 seconds...", zap.Error(err))
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
+			updatesChan := bot.GetUpdatesChan(updateConfig) // 修正：GetUpdatesChan只返回一个值
+			
 			// Process updates from the channel
 			for update := range updatesChan { // Loop will break if updatesChan closes
 				select {
@@ -941,8 +931,10 @@ func monitorRule(ctx context.Context, rule Rule) { // rule 现在是副本
 					confirmBtn := tgbotapi.NewInlineKeyboardButtonData(globalAppConfig.TelegramTemplates.ConfirmButtonText, "confirm_"+currentRule.Domain)
 					manualBtn := tgbotapi.NewInlineKeyboardButtonData(globalAppConfig.TelegramTemplates.ManualButtonText, "manual_"+currentRule.Domain)
 					keyboard := tgbotapi.NewInlineKeyboardMarkup(
-						tgbotapi.NewInlineKeyboardRow(confirmBtn, manualBtn),
+						tgbotapi.NewInlineKeyboardRow(confirmBtn), // 确认按钮单独一行
+						tgbotapi.NewInlineKeyboardRow(manualBtn),  // 人工模式按钮单独一行
 					)
+					// 使用新的 sendTelegramMessage，传递 keyboard
 					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, currentRule.Domain), "Markdown", &keyboard)
 					state.Notified = true
 					updateStatesToCM()
@@ -1041,12 +1033,11 @@ func sendTelegramMessage(chatID int64, text string, parseMode string, keyboard *
 	}
 }
 
-// sendTelegramNotification 是一个过时函数，调用通用的sendTelegramMessage
-// 保持它只是为了兼容之前monitorRule里的调用，可以考虑直接替换掉
-// 此函数会被monitorRule调用，如果不想看到弃用警告，可以直接在monitorRule中替换调用
+// sendTelegramNotification 函数已弃用，请直接使用 sendTelegramMessage
+// 此函数会被monitorRule调用，建议直接在monitorRule中替换为 sendTelegramMessage
 func sendTelegramNotification(domain string) {
 	logger.Debug("Deprecated sendTelegramNotification called. Use sendTelegramMessage directly.", zap.String("domain", domain))
-	// 注意：这里无法传递键盘，因为老函数签名不支持。所以强烈建议直接替换monitorRule中的调用
+	// 为了兼容性，这里调用sendTelegramMessage，但无法传递Inline Keyboard
 	sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, domain), "Markdown", nil)
 }
 
