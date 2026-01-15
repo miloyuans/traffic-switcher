@@ -406,7 +406,8 @@ func monitorRule(ctx context.Context, bot *tgbotapi.BotAPI, rule Rule) {
 			return
 		case <-ticker.C:
 			healthy := checkURL(rule.CheckURL, rule.CheckCondition)
-			probeSuccess.Set(func() float64 { if healthy { return 1 } return 0 }())
+			probeSuccess.Set(func() float64 { if healthy { return 1 }; return 0 }())
+			//probeSuccess.Set(func() float64 { if healthy { return 1 } return 0 }())
 
 			stateI, _ := states.Load(rule.Domain)
 			state := stateI.(*State)
