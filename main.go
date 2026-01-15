@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json" // json用于序列化k8s patch和CM数据
 	"flag"
 	"fmt"
 	"html/template"
@@ -22,12 +22,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	"gopkg.in/yaml.v2" // 引入yaml解析库
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait" // `wait`包现在被用于Telegram消息发送的重试逻辑
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -39,42 +40,45 @@ import (
 
 // TelegramTemplates 定义了Telegram通知消息的模板
 type TelegramTemplates struct {
-	StartupMessage  string `json:"startup_message"`  // 服务启动时的消息
-	FaultMessage    string `json:"fault_message"`    // 探测到故障时的通知
-	ConfirmReply    string `json:"confirm_reply"`    // 确认切换后的回复
-	ManualReply     string `json:"manual_reply"`     // 手动模式切换后的回复
-	RecoveryMessage string `json:"recovery_message"` // 故障恢复后的通知
+	StartupMessage            string `yaml:"startup_message" json:"startup_message"`
+	FaultMessage              string `yaml:"fault_message" json:"fault_message"`
+	ConfirmReply              string `yaml:"confirm_reply" json:"confirm_reply"`
+	ManualReply               string `yaml:"manual_reply" json:"manual_reply"`
+	RecoveryMessage           string `yaml:"recovery_message" json:"recovery_message"`
+	ForceMaintenanceOnMessage string `yaml:"force_maintenance_on_message" json:"force_maintenance_on_message"`
+	ForceMaintenanceOffMessage string `yaml:"force_maintenance_off_message" json:"force_maintenance_off_message"`
 }
 
 // GlobalConfig 定义了应用程序的全局配置，包括HTTP监听和Telegram模板
 type GlobalConfig struct {
-	HTTPListenAddr    string            `json:"http_listen_addr"`
-	HTTPListenPort    string            `json:"http_listen_port"`
-	TelegramTemplates TelegramTemplates `json:"telegram_templates"`
+	HTTPListenAddr    string            `yaml:"http_listen_addr" json:"http_listen_addr"`
+	HTTPListenPort    string            `yaml:"http_listen_port" json:"http_listen_port"`
+	TelegramTemplates TelegramTemplates `yaml:"telegram_templates" json:"telegram_templates"`
 }
 
 // Rule 定义了单个域名/服务的切换规则
 type Rule struct {
-	Domain            string      `json:"domain"`
-	CheckURL          string      `json:"check_url"`
-	CheckCondition    string      `json:"check_condition"`
-	FailThreshold     int         `json:"fail_threshold"`
-	RecoveryThreshold int         `json:"recovery_threshold"`
-	CheckInterval     string      `json:"check_interval"`
-	MaintenanceLabel  string      `json:"maintenance_pod_label"`
-	Services          []ServiceNS `json:"services"`
+	Domain            string      `yaml:"domain" json:"domain"`
+	CheckURL          string      `yaml:"check_url" json:"check_url"`
+	CheckCondition    string      `yaml:"check_condition" json:"check_condition"`
+	FailThreshold     int         `yaml:"fail_threshold" json:"fail_threshold"`
+	RecoveryThreshold int         `yaml:"recovery_threshold" json:"recovery_threshold"`
+	CheckInterval     string      `yaml:"check_interval" json:"check_interval"`
+	ForceSwitch       bool        `yaml:"force_switch" json:"force_switch"` // 新增：每域名独立强制切换开关
+	MaintenanceLabel  string      `yaml:"maintenance_pod_label" json:"maintenance_pod_label"`
+	Services          []ServiceNS `yaml:"services" json:"services"`
 }
 
 // ServiceNS 定义了服务及其所属的命名空间
 type ServiceNS struct {
-	Namespace string   `json:"namespace"`
-	SvcNames  []string `json:"svc_names"`
+	Namespace string   `yaml:"namespace" json:"namespace"`
+	SvcNames  []string `yaml:"svc_names" json:"svc_names"`
 }
 
 // Config 包含了所有规则和全局配置
 type Config struct {
-	Global GlobalConfig `json:"global_config"`
-	Rules  []Rule       `json:"rules"`
+	Global GlobalConfig `yaml:"global_config" json:"global_config"`
+	Rules  []Rule       `yaml:"rules" json:"rules"`
 }
 
 // State 存储了每个域名的当前状态
@@ -90,14 +94,15 @@ var (
 	telegramToken     = os.Getenv("TELEGRAM_BOT_TOKEN")
 	telegramChatIDStr = os.Getenv("TELEGRAM_CHAT_ID")
 	telegramChatID    int64
-	rules             []Rule
-	states            sync.Map // domain -> *State
+	rules             []Rule          // 存储当前加载的规则
+	previousRulesMap  map[string]Rule // 存储上一次加载的规则，用于比较变化
+	states            sync.Map        // domain -> *State
 	podIPs            []string
-	mu                sync.RWMutex
+	mu                sync.RWMutex // 用于保护 rules, htmlTemplate 和 globalAppConfig 的读写
 	clientset         *kubernetes.Clientset
 	htmlTemplate      *template.Template
 	originalEndpoints sync.Map // key: ns-svc, value: []byte (json subsets)
-	maintenancePort   = 80 // Default, but can be overridden by rule label or future config
+	maintenancePort   = 80     // Default, but can be overridden by rule label or future config
 	logger            *zap.Logger
 	probeSuccess      = prometheus.NewGauge(prometheus.GaugeOpts{Name: "probe_success_rate", Help: "URL probe success rate"})
 	probeFailure      = prometheus.NewCounter(prometheus.CounterOpts{Name: "probe_failure_count", Help: "Number of probe failures"})
@@ -107,26 +112,18 @@ var (
 	programPodName    = os.Getenv("POD_NAME")
 	leaderLeaseName   = "traffic-switcher-leader"
 
-	appBotApi *tgbotapi.BotAPI // 全局Bot实例，修改为指针类型
-	// 用于存储加载的全局配置，便于在各个函数中使用
-	globalAppConfig struct {
-		HTTPListenAddr    string
-		HTTPListenPort    string
-		TelegramTemplates TelegramTemplates
-	}
+	appBotApi *tgbotapi.BotAPI // 全局Bot实例，指针类型
+	globalAppConfig GlobalConfig // 全局应用配置
 )
 
 func init() {
 	var err error
-	// 使用Zap Logger，生产环境配置
 	logger, err = zap.NewProduction()
 	if err != nil {
 		log.Fatalf("Failed to init zap: %v", err)
 	}
-	// 注册Prometheus指标
 	prometheus.MustRegister(probeSuccess, switchCount, probeFailure)
 
-	// 解析Telegram Chat ID
 	if telegramChatIDStr != "" {
 		telegramChatID, err = strconv.ParseInt(telegramChatIDStr, 10, 64)
 		if err != nil {
@@ -137,20 +134,19 @@ func init() {
 		logger.Warn("TELEGRAM_CHAT_ID environment variable is empty. Telegram notifications will be disabled.")
 	}
 
-	// 设置程序运行的命名空间，如果环境变量未设置则默认为"default"
 	if programNamespace == "" {
 		programNamespace = "default"
 		logger.Info("POD_NAMESPACE not set, defaulting to 'default' namespace.")
 	}
+
+	previousRulesMap = make(map[string]Rule) // 初始化
 }
 
 func main() {
-	defer logger.Sync() // 确保所有缓冲的日志都被刷新
+	defer logger.Sync()
 
-	// 加载Kubernetes配置
-	config, err := rest.InClusterConfig() // 尝试在集群内加载配置
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		// 如果在集群内加载失败，尝试从kubeconfig文件加载
 		kubeconfig := flag.String("kubeconfig", "", "kubeconfig path")
 		flag.Parse()
 		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
@@ -163,15 +159,13 @@ func main() {
 		logger.Fatal("Failed to create Kubernetes clientset.", zap.Error(err))
 	}
 
-	// 加载初始配置和状态
-	loadConfig()
+	loadConfig() // 首次加载配置
 	loadHTML()
 	loadStatesFromCM()
 
-	// 启动HTTP服务器用于维护页和webhook
 	httpListenAddr := fmt.Sprintf("%s:%s", globalAppConfig.HTTPListenAddr, globalAppConfig.HTTPListenPort)
 	http.HandleFunc("/", maintenanceHandler)
-	http.HandleFunc("/callback", telegramCallbackHandler)
+	// http.HandleFunc("/callback", telegramCallbackHandler) // 移除 webhook 路由
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/healthz", healthHandler)
 	go func() {
@@ -181,11 +175,9 @@ func main() {
 		}
 	}()
 
-	// 启动配置文件监听
 	go watchConfigFile()
 
-	// Leader选举
-	rl, err := resourcelock.New(resourcelock.LeasesResourceLock, // 修复：使用正确的常量名
+	rl, err := resourcelock.New(resourcelock.LeasesResourceLock,
 		programNamespace,
 		leaderLeaseName,
 		clientset.CoreV1(),
@@ -203,10 +195,10 @@ func main() {
 		RenewDeadline: 10 * time.Second,
 		RetryPeriod:   2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: run, // 成为Leader后执行run函数
+			OnStartedLeading: run,
 			OnStoppedLeading: func() {
 				logger.Info("Lost leadership, shutting down.")
-				os.Exit(0) // 失去Leader权限则退出
+				os.Exit(0)
 			},
 		},
 		Name: leaderLeaseName,
@@ -215,105 +207,206 @@ func main() {
 		logger.Fatal("Failed to create leader elector.", zap.Error(err))
 	}
 
-	le.Run(context.Background()) // 开始Leader选举
+	le.Run(context.Background())
 }
 
-// run 在成为Leader后执行，负责核心业务逻辑
 func run(ctx context.Context) {
 	logger.Info("Successfully acquired leadership, starting core operations.")
 
-	// 监听自身Pod的变化，更新维护IP列表
 	go watchOwnPods()
 
-	// 初始化Telegram Bot API
 	var err error
-	appBotApi, err = tgbotapi.NewBotAPI(telegramToken) // 使用全局bot实例，此处赋值给指针
+	appBotApi, err = tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
 		logger.Fatal("Failed to initialize Telegram Bot API. Please ensure TELEGRAM_BOT_TOKEN is valid.", zap.Error(err))
 	}
 
-	// 验证Telegram Token有效性
 	botUser, err := appBotApi.GetMe()
 	if err != nil {
 		logger.Fatal("Telegram Token is invalid or API is unreachable. Cannot get bot information.", zap.Error(err))
 	}
 	logger.Info("Telegram Bot connected successfully", zap.String("bot_username", botUser.UserName))
 
-	// 如果配置了Telegram Chat ID，发送启动消息
+	// 清除潜在的旧 Webhook (可选，但推荐)
+	// 如果之前设置过 Webhook，这里可以确保它被禁用
+	_, err = appBotApi.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true})
+	if err != nil {
+		logger.Warn("Failed to delete old Telegram webhook (if any): %v", zap.Error(err))
+	} else {
+		logger.Info("Successfully deleted old Telegram webhook configuration.")
+	}
+
+	// 启动 Long Polling 来接收 Telegram 消息
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60 // Long polling timeout
+	updates := appBotApi.GetUpdatesChan(u)
+	go processTelegramUpdates(ctx, updates) // 在一个单独的goroutine中处理更新
+
 	if telegramChatID != 0 && globalAppConfig.TelegramTemplates.StartupMessage != "" {
 		startupMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.StartupMessage, programPodName, programNamespace)
-		startupMsg := tgbotapi.NewMessage(telegramChatID, startupMsgText)
-		startupMsg.ParseMode = "Markdown"
-		
-		// 发送启动消息，并增加重试逻辑
-		_, err = appBotApi.Send(startupMsg)
-		if err != nil {
-			logger.Error("Initial Telegram startup message send failed, retrying...", zap.Error(err), zap.Int64("chat_id", telegramChatID), zap.String("message", startupMsgText))
-			retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-				_, sendErr := appBotApi.Send(startupMsg)
-				if sendErr != nil {
-					logger.Warn("Telegram startup message retry failed", zap.Error(sendErr))
-					return false, nil // Keep retrying
-				}
-				return true, nil // Success
-			})
-			if retryErr != nil && retryErr != context.DeadlineExceeded {
-				logger.Error("Failed to send Telegram startup message after retries", zap.Error(retryErr), zap.Int64("chat_id", telegramChatID))
-			} else if retryErr == context.DeadlineExceeded {
-				logger.Warn("Telegram startup message send timed out after retries", zap.Int64("chat_id", telegramChatID))
-			} else {
-				logger.Info("Telegram startup message sent successfully after retries", zap.String("message", startupMsgText))
-			}
-		} else {
-			logger.Info("Telegram startup message sent immediately", zap.String("message", startupMsgText))
-		}
+		sendTelegramMessage(telegramChatID, startupMsgText, "Markdown")
 	} else {
 		logger.Warn("Skipping Telegram startup message: TELEGRAM_CHAT_ID not set or template is empty.")
 	}
 
-	// 开始监控所有规则
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if len(rules) == 0 {
+	mu.RLock()
+	currentRules := rules
+	mu.RUnlock()
+
+	if len(currentRules) == 0 {
 		logger.Warn("No rules loaded from config. Monitoring will not start.")
 	}
 
-	for _, rule := range rules {
+	// 为每个规则启动监控goroutine
+	for _, rule := range currentRules {
 		domain := rule.Domain
-		// 初始化域名状态，如果不存在则设为正常
 		if _, loaded := states.LoadOrStore(domain, &State{Status: "normal"}); !loaded {
 			logger.Info("Initialized state for new domain", zap.String("domain", domain), zap.String("status", "normal"))
-			updateStatesToCM() // 新增状态时更新CM
+			updateStatesToCM()
 		}
-		go monitorRule(cancelCtx, rule) // 为每个规则启动独立的监控goroutine
+		// 传递 rule 的一个副本，避免在 goroutine 外部 rule 变量变化影响
+		go monitorRule(cancelCtx, rule)
 	}
 
-	// 监听系统中断信号，优雅关闭
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	logger.Info("Shutting down application due to signal.")
-	updateStatesToCM() // 关闭前保存所有状态
+	updateStatesToCM()
 }
+
+// processTelegramUpdates 持续处理从Telegram Bot API接收到的更新
+func processTelegramUpdates(ctx context.Context, updates tgbotapi.UpdatesChannel) {
+	logger.Info("Starting Telegram long polling for updates...")
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("Stopping Telegram update processing due to context cancellation.")
+			return
+		case update, ok := <-updates:
+			if !ok {
+				logger.Error("Telegram updates channel closed, attempting to re-establish polling.")
+				// 这里可以添加逻辑来重新初始化 GetUpdatesChan，或者直接让外层goroutine决定如何处理
+				time.Sleep(5 * time.Second) // 避免无限循环
+				return // 暂时退出，让run函数决定是否重新启动
+			}
+			if update.Message == nil || update.Message.Text == "" {
+				logger.Debug("Received non-message or empty message Telegram update, ignoring.", zap.Any("update", update))
+				continue
+			}
+			// 将原始的 telegramCallbackHandler 逻辑移到这里
+			handleTelegramMessage(update.Message)
+		}
+	}
+}
+
+// handleTelegramMessage 处理单个Telegram消息
+func handleTelegramMessage(message *tgbotapi.Message) {
+	text := message.Text
+	chatID := message.Chat.ID
+	logger.Info("Received Telegram message", zap.String("from", message.From.UserName), zap.String("text", text), zap.Int64("chat_id", chatID))
+
+	var replyText string
+	targetDomain := ""
+
+	if strings.HasPrefix(text, "/confirm_") {
+		targetDomain = strings.TrimPrefix(text, "/confirm_")
+		stateI, ok := states.Load(targetDomain)
+		if ok {
+			state := stateI.(*State)
+			if state.Status == "normal" {
+				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No action needed.", targetDomain)
+			} else {
+				if state.Confirmed { // 已经确认过
+					replyText = fmt.Sprintf("✅ Domain `%s` is already in confirmed maintenance mode. No change.", targetDomain)
+				} else {
+					state.Confirmed = true
+					updateStatesToCM()
+					logger.Info("Traffic switch confirmed by Telegram user", zap.String("domain", targetDomain), zap.String("user", message.From.UserName))
+					replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ConfirmReply, targetDomain)
+
+					// 找到对应的rule并执行切换
+					mu.RLock()
+					currentRules := rules
+					mu.RUnlock()
+					for _, rule := range currentRules {
+						if rule.Domain == targetDomain {
+							switchToMaintenance(rule) // 立即执行切换
+							break
+						}
+					}
+				}
+			}
+		} else {
+			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", targetDomain)
+		}
+	} else if strings.HasPrefix(text, "/manual_") {
+		targetDomain = strings.TrimPrefix(text, "/manual_")
+		stateI, ok := states.Load(targetDomain)
+		if ok {
+			state := stateI.(*State)
+			if state.Status == "normal" { // 如果是正常状态，则不需要回切
+				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No switch to revert.", targetDomain)
+			} else {
+				// 如果是故障状态，则取消确认，并尝试切回
+				state.Confirmed = false
+				state.Notified = false // 允许重新通知
+				updateStatesToCM()
+				logger.Info("Manual mode enabled by Telegram user, reverting switch if active", zap.String("domain", targetDomain), zap.String("user", message.From.UserName))
+				replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ManualReply, targetDomain)
+				
+				// 找到对应的rule并执行切回
+				mu.RLock()
+				currentRules := rules
+				mu.RUnlock()
+				for _, rule := range currentRules {
+					if rule.Domain == targetDomain {
+						switchBack(rule) // 立即执行切回
+						break
+					}
+				}
+			}
+		} else {
+			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", targetDomain)
+		}
+	} else {
+		replyText = "Hello! I am Traffic Switcher bot. You can interact with me to manage traffic for your domains. Try `/confirm_yourdomain` or `/manual_yourdomain`."
+	}
+
+	if replyText != "" {
+		sendTelegramMessage(chatID, replyText, "Markdown")
+	}
+}
+
 
 // loadConfig 从配置文件加载规则和全局配置
 func loadConfig() {
-	data, err := os.ReadFile(configPath) // 修复：使用os.ReadFile
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		logger.Error("Failed to read config file", zap.String("path", configPath), zap.Error(err))
 		return
 	}
-	var config Config
-	if err = json.Unmarshal(data, &config); err != nil {
-		logger.Error("Failed to parse config file (JSON format expected)", zap.String("path", configPath), zap.Error(err))
+	var loadedConfig Config
+	if err = yaml.Unmarshal(data, &loadedConfig); err != nil { // 使用 yaml.Unmarshal
+		logger.Error("Failed to parse config file (YAML format expected)", zap.String("path", configPath), zap.Error(err))
 		return
 	}
 
-	// 更新全局配置
-	globalAppConfig.HTTPListenAddr = config.Global.HTTPListenAddr
-	globalAppConfig.HTTPListenPort = config.Global.HTTPListenPort
-	globalAppConfig.TelegramTemplates = config.Global.TelegramTemplates
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 复制当前的 rules 到 previousRulesMap
+	previousRulesMap = make(map[string]Rule, len(rules))
+	for _, r := range rules {
+		previousRulesMap[r.Domain] = r
+	}
+
+	// 更新全局配置和规则
+	globalAppConfig = loadedConfig.Global
+	rules = loadedConfig.Rules
 
 	// 设置HTTP监听地址和端口的默认值
 	if globalAppConfig.HTTPListenAddr == "" {
@@ -339,18 +432,111 @@ func loadConfig() {
 	if globalAppConfig.TelegramTemplates.RecoveryMessage == "" {
 		globalAppConfig.TelegramTemplates.RecoveryMessage = "🟢 **Domain Recovered!**\n\nDomain: `%s` is healthy again.\nTraffic switched back to original endpoints."
 	}
+	if globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage == "" {
+		globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage = "🚧 **Force Maintenance ON!**\n\nDomain: `%s` is manually forced into maintenance mode. Health checks are suspended."
+	}
+	if globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage == "" {
+		globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage = "✅ **Force Maintenance OFF!**\n\nDomain: `%s` is restored from manual maintenance mode. Health checks resumed."
+	}
 
-	mu.Lock()
-	rules = config.Rules // 更新规则
-	mu.Unlock()
 	logger.Info("Config loaded successfully",
 		zap.Int("rules_count", len(rules)),
 		zap.String("http_listen_addr", globalAppConfig.HTTPListenAddr),
-		zap.String("http_listen_port", globalAppConfig.HTTPListenPort),
-		zap.Bool("telegram_templates_loaded", globalAppConfig.TelegramTemplates.FaultMessage != ""))
+		zap.String("http_listen_port", globalAppConfig.HTTPListenPort))
+
+	// 处理规则中 ForceSwitch 的变化
+	handleRuleForceSwitchChanges()
 }
 
-// loadHTML 加载维护页面的HTML模板
+// handleRuleForceSwitchChanges 处理规则中 ForceSwitch 状态的变化
+func handleRuleForceSwitchChanges() {
+	// 创建新的规则映射方便查找
+	newRulesMap := make(map[string]Rule, len(rules))
+	for _, r := range rules {
+		newRulesMap[r.Domain] = r
+	}
+
+	// 遍历新规则，检测 ForceSwitch 变化
+	for domain, newRule := range newRulesMap {
+		oldRule, exists := previousRulesMap[domain]
+
+		if exists { // 规则存在且未被删除
+			if newRule.ForceSwitch && !oldRule.ForceSwitch {
+				// ForceSwitch 从 false 变为 true
+				logger.Info("Force switch enabled for domain via config.", zap.String("domain", domain))
+				forceDomainToMaintenance(newRule)
+				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage != "" {
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage, domain), "Markdown")
+				}
+			} else if !newRule.ForceSwitch && oldRule.ForceSwitch {
+				// ForceSwitch 从 true 变为 false
+				logger.Info("Force switch disabled for domain via config.", zap.String("domain", domain))
+				forceDomainToNormal(newRule)
+				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage != "" {
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage, domain), "Markdown")
+				}
+			}
+		} else {
+			// 新增的规则，如果 ForceSwitch 为 true，则强制维护
+			if newRule.ForceSwitch {
+				logger.Info("New rule with force switch enabled via config.", zap.String("domain", domain))
+				forceDomainToMaintenance(newRule)
+				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage != "" {
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOnMessage, domain), "Markdown")
+				}
+			}
+		}
+	}
+
+	// 处理被删除的规则，如果之前是强制维护状态，则需要切回
+	for domain, oldRule := range previousRulesMap {
+		if _, exists := newRulesMap[domain]; !exists { // 规则在新配置中不存在
+			if oldRule.ForceSwitch {
+				logger.Info("Rule removed, disabling force switch for domain.", zap.String("domain", domain))
+				// 此时 oldRule 是唯一的规则信息，直接使用它来回切
+				forceDomainToNormal(oldRule)
+				if telegramChatID != 0 && globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage != "" {
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.ForceMaintenanceOffMessage, domain), "Markdown")
+				}
+			}
+		}
+	}
+}
+
+// forceDomainToMaintenance 强制某个域名进入维护模式
+func forceDomainToMaintenance(rule Rule) {
+	stateI, _ := states.LoadOrStore(rule.Domain, &State{}) // 确保状态存在
+	state := stateI.(*State)
+	// 只有当状态与期望不符时才执行操作，避免重复调用
+	if state.Status != "failed" || !state.Confirmed || !state.Notified {
+		state.Status = "failed"
+		state.Notified = true  // 标记为已通知，防止自动再次通知
+		state.Confirmed = true // 标记为已确认，以便执行切换
+		updateStatesToCM()
+		logger.Info("Manually forcing domain to maintenance state", zap.String("domain", rule.Domain), zap.Bool("force_switch", rule.ForceSwitch))
+		switchToMaintenance(rule)
+	} else {
+		logger.Debug("Domain already in expected forced maintenance state, no action needed.", zap.String("domain", rule.Domain))
+	}
+}
+
+// forceDomainToNormal 强制某个域名恢复正常模式
+func forceDomainToNormal(rule Rule) {
+	stateI, _ := states.LoadOrStore(rule.Domain, &State{}) // 确保状态存在
+	state := stateI.(*State)
+	// 只有当状态与期望不符时才执行操作
+	if state.Status != "normal" || state.Confirmed || state.Notified {
+		state.Status = "normal"
+		state.Notified = false
+		state.Confirmed = false
+		updateStatesToCM()
+		logger.Info("Manually forcing domain to normal state", zap.String("domain", rule.Domain), zap.Bool("force_switch", rule.ForceSwitch))
+		switchBack(rule)
+	} else {
+		logger.Debug("Domain already in expected normal state, no action needed.", zap.String("domain", rule.Domain))
+	}
+}
+
 func loadHTML() {
 	tmpl, err := template.ParseFiles(htmlPath)
 	if err != nil {
@@ -358,17 +544,15 @@ func loadHTML() {
 		return
 	}
 	mu.Lock()
+	defer mu.Unlock()
 	htmlTemplate = tmpl
-	mu.Unlock()
 	logger.Info("Maintenance HTML template loaded successfully", zap.String("path", htmlPath))
 }
 
-// loadStatesFromCM 从ConfigMap加载持久化的状态
 func loadStatesFromCM() {
 	cm, err := clientset.CoreV1().ConfigMaps(programNamespace).Get(context.Background(), stateConfigMap, metav1.GetOptions{})
 	if err != nil {
 		logger.Warn("State ConfigMap not found, attempting to create it.", zap.String("cm_name", stateConfigMap), zap.Error(err))
-		// 如果ConfigMap不存在，则创建
 		_, createErr := clientset.CoreV1().ConfigMaps(programNamespace).Create(context.Background(), &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: stateConfigMap},
 			Data:       make(map[string]string),
@@ -405,7 +589,6 @@ func loadStatesFromCM() {
 		zap.String("cm_name", stateConfigMap))
 }
 
-// updateStatesToCM 将当前内存中的状态持久化到ConfigMap
 func updateStatesToCM() {
 	cmData := make(map[string]string)
 	states.Range(func(k, v interface{}) bool {
@@ -414,7 +597,7 @@ func updateStatesToCM() {
 		data, marshalErr := json.Marshal(state)
 		if marshalErr != nil {
 			logger.Error("Failed to marshal state for domain", zap.String("domain", domain), zap.Error(marshalErr))
-			return true // 继续处理下一个
+			return true
 		}
 		cmData["state-"+domain] = string(data)
 		return true
@@ -444,7 +627,6 @@ func updateStatesToCM() {
 	}
 }
 
-// watchConfigFile 监听配置文件和HTML模板文件的变化，并重新加载
 func watchConfigFile() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -452,12 +634,10 @@ func watchConfigFile() {
 	}
 	defer watcher.Close()
 
-	// 监听配置文件目录
 	configDir := filepath.Dir(configPath)
 	if err = watcher.Add(configDir); err != nil {
 		logger.Fatal("Failed to add config directory to watcher", zap.String("dir", configDir), zap.Error(err))
 	}
-	// 监听HTML模板文件目录
 	htmlDir := filepath.Dir(htmlPath)
 	if err = watcher.Add(htmlDir); err != nil {
 		logger.Fatal("Failed to add HTML directory to watcher", zap.String("dir", htmlDir), zap.Error(err))
@@ -470,7 +650,6 @@ func watchConfigFile() {
 			if !ok {
 				return
 			}
-			// 只处理写入事件
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
 				logger.Info("File system event detected", zap.String("event", event.Op.String()), zap.String("file", event.Name))
 				if strings.Contains(event.Name, "rules.yaml") {
@@ -491,7 +670,6 @@ func watchConfigFile() {
 	}
 }
 
-// watchOwnPods 监听自身Pod的变化，以更新维护模式下的IP列表
 func watchOwnPods() {
 	listWatch := cache.NewListWatchFromClient(
 		clientset.CoreV1().RESTClient(),
@@ -500,11 +678,10 @@ func watchOwnPods() {
 		fields.Everything(),
 	)
 
-	// 创建Informer，监听Pod的Add/Update/Delete事件
 	_, controller := cache.NewInformer(
 		listWatch,
 		&corev1.Pod{},
-		0, // 重新同步周期，0表示不定期
+		0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    func(obj interface{}) { logger.Debug("Pod added event detected"); updatePodIPs() },
 			UpdateFunc: func(oldObj, newObj interface{}) { logger.Debug("Pod updated event detected"); updatePodIPs() },
@@ -515,11 +692,10 @@ func watchOwnPods() {
 	stop := make(chan struct{})
 	defer close(stop)
 	logger.Info("Kubernetes Pod watcher started for traffic-switcher pods.")
-	go controller.Run(stop) // 运行控制器
-	select {}               // 阻塞当前goroutine，使其永不退出
+	go controller.Run(stop)
+	select {}
 }
 
-// updatePodIPs 获取所有打有"app=traffic-switcher"标签的Pod的IP
 func updatePodIPs() {
 	selector := labels.SelectorFromSet(labels.Set{"app": "traffic-switcher"}).String()
 	pods, err := clientset.CoreV1().Pods(programNamespace).List(context.Background(), metav1.ListOptions{
@@ -532,7 +708,6 @@ func updatePodIPs() {
 
 	var ips []string
 	for _, pod := range pods.Items {
-		// 只选择处于Running状态且有IP的Pod
 		if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			ips = append(ips, pod.Status.PodIP)
 		}
@@ -543,10 +718,8 @@ func updatePodIPs() {
 	podIPs = ips
 	mu.Unlock()
 
-	// 只有IP列表实际发生变化才记录Info日志，避免日志刷屏
 	if !stringSliceEqual(currentPodIPs, ips) {
 		logger.Info("Pod IPs updated", zap.Int("count", len(ips)), zap.Strings("new_ips", ips))
-		// 如果IP列表发生变化，重新patch已切换到维护模式的服务
 		logger.Debug("Pod IPs changed, re-patching switched services if any.")
 		rePatchSwitchedSvcs()
 	} else {
@@ -554,7 +727,6 @@ func updatePodIPs() {
 	}
 }
 
-// 辅助函数，比较两个字符串切片是否相等（不考虑顺序）
 func stringSliceEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -572,32 +744,29 @@ func stringSliceEqual(a, b []string) bool {
 	return true
 }
 
-// rePatchSwitchedSvcs 重新patch所有已处于"failed"且"confirmed"状态的服务，
-// 用于Pod IP变化后更新维护页面的目标IP
 func rePatchSwitchedSvcs() {
 	logger.Info("Initiating re-patch for currently switched services.")
-	mu.RLock() // 读锁，因为只读rules
+	mu.RLock()
 	currentRules := rules
 	mu.RUnlock()
 
 	for _, rule := range currentRules {
 		stateI, ok := states.Load(rule.Domain)
 		if !ok {
-			continue // 该域名没有状态，跳过
+			continue
 		}
 		state := stateI.(*State)
 		if state.Status == "failed" && state.Confirmed {
 			logger.Info("Re-patching service for confirmed failed domain", zap.String("domain", rule.Domain))
-			switchToMaintenance(rule) // 重新执行切换逻辑，更新endpoints的IPs
+			switchToMaintenance(rule)
 		}
 	}
 	logger.Info("Re-patch process completed.")
 }
 
-// monitorRule 针对单个规则进行周期性健康检查和状态管理
-func monitorRule(ctx context.Context, rule Rule) {
-	failCount := 0    // 连续失败计数
-	recoveryCount := 0 // 连续恢复计数
+func monitorRule(ctx context.Context, rule Rule) { // rule 现在是副本
+	failCount := 0
+	recoveryCount := 0
 	interval, err := time.ParseDuration(rule.CheckInterval)
 	if err != nil {
 		logger.Error("Failed to parse check interval for rule", zap.String("domain", rule.Domain), zap.String("interval_str", rule.CheckInterval), zap.Error(err))
@@ -618,108 +787,101 @@ func monitorRule(ctx context.Context, rule Rule) {
 			logger.Info("Monitor for rule stopped due to context cancellation", zap.String("domain", rule.Domain))
 			return
 		case <-ticker.C:
-			// 执行URL探测，最多重试3次，每次间隔1秒
+			// 在每次循环开始时，从全局规则中获取当前域名的最新规则配置
+			mu.RLock()
+			var currentRule Rule
+			found := false
+			for _, r := range rules {
+				if r.Domain == rule.Domain {
+					currentRule = r
+					found = true
+					break
+				}
+			}
+			mu.RUnlock()
+
+			if !found {
+				logger.Warn("Rule for domain no longer exists in config, stopping monitor.", zap.String("domain", rule.Domain))
+				return // 规则被删除，退出监控goroutine
+			}
+
+			// 如果当前规则被标记为强制维护，则跳过健康检查
+			if currentRule.ForceSwitch {
+				logger.Debug("Domain under forced maintenance, skipping health check.", zap.String("domain", currentRule.Domain))
+				continue
+			}
+
+			// 以下是正常模式下的健康检查和状态管理逻辑
 			healthy := false
 			for i := 0; i < 3; i++ {
-				if checkURL(rule.CheckURL, rule.CheckCondition) {
+				if checkURL(currentRule.CheckURL, currentRule.CheckCondition) {
 					healthy = true
 					break
 				}
-				logger.Debug("URL probe retry", zap.String("domain", rule.Domain), zap.String("url", rule.CheckURL), zap.Int("attempt", i+1))
-				time.Sleep(1 * time.Second) // 重试间隔
+				logger.Debug("URL probe retry", zap.String("domain", currentRule.Domain), zap.String("url", currentRule.CheckURL), zap.Int("attempt", i+1))
+				time.Sleep(1 * time.Second)
 			}
 
-			// 更新Prometheus指标
 			if healthy {
 				probeSuccess.Set(1)
-				logger.Debug("Probe successful", zap.String("domain", rule.Domain), zap.String("url", rule.CheckURL))
+				logger.Debug("Probe successful", zap.String("domain", currentRule.Domain), zap.String("url", currentRule.CheckURL))
 			} else {
 				probeFailure.Inc()
 				probeSuccess.Set(0)
-				logger.Warn("Probe failed", zap.String("domain", rule.Domain), zap.String("url", rule.CheckURL))
+				logger.Warn("Probe failed", zap.String("domain", currentRule.Domain), zap.String("url", currentRule.CheckURL))
 			}
 
-			stateI, ok := states.Load(rule.Domain)
+			stateI, ok := states.Load(currentRule.Domain)
 			if !ok {
-				logger.Error("State for domain not found in sync.Map, possibly a race condition or uninitialized. Skipping.", zap.String("domain", rule.Domain))
+				logger.Error("State for domain not found in sync.Map, possibly a race condition or uninitialized. Skipping.", zap.String("domain", currentRule.Domain))
 				continue
 			}
 			state := stateI.(*State)
 
-			// 处理探测结果
 			if !healthy {
 				failCount++
-				recoveryCount = 0 // 失败则重置恢复计数
-				logger.Debug("Domain failing", zap.String("domain", rule.Domain), zap.Int("fail_count", failCount), zap.Int("fail_threshold", rule.FailThreshold))
+				recoveryCount = 0
+				logger.Debug("Domain failing", zap.String("domain", currentRule.Domain), zap.Int("fail_count", failCount), zap.Int("fail_threshold", currentRule.FailThreshold))
 
-				// 达到失败阈值且状态正常，未通知过
-				if failCount >= rule.FailThreshold && state.Status == "normal" && !state.Notified {
+				if failCount >= currentRule.FailThreshold && state.Status == "normal" && !state.Notified {
 					logger.Warn("Domain reached failure threshold, sending notification.",
-						zap.String("domain", rule.Domain),
+						zap.String("domain", currentRule.Domain),
 						zap.Int("fail_count", failCount),
-						zap.Int("threshold", rule.FailThreshold))
-					sendTelegramNotification(rule.Domain)
-					state.Notified = true // 标记为已通知
+						zap.Int("threshold", currentRule.FailThreshold))
+					sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, currentRule.Domain, currentRule.Domain, currentRule.Domain), "Markdown")
+					state.Notified = true
 					updateStatesToCM()
 				}
-				// 已经确认切换，则执行或保持切换到维护模式
 				if state.Confirmed {
-					logger.Info("Domain confirmed for maintenance, switching to or ensuring maintenance mode.", zap.String("domain", rule.Domain))
-					switchToMaintenance(rule)
-					if state.Status != "failed" { // 只有在状态改变时才更新并计数
+					logger.Info("Domain confirmed for maintenance, switching to or ensuring maintenance mode.", zap.String("domain", currentRule.Domain))
+					switchToMaintenance(currentRule)
+					if state.Status != "failed" {
 						state.Status = "failed"
 						switchCount.Inc()
-						logger.Info("Traffic successfully switched to maintenance page.", zap.String("domain", rule.Domain))
+						logger.Info("Traffic successfully switched to maintenance page.", zap.String("domain", currentRule.Domain))
 						updateStatesToCM()
 					} else {
-						logger.Debug("Domain already in failed state, maintenance mode ensured.", zap.String("domain", rule.Domain))
+						logger.Debug("Domain already in failed state, maintenance mode ensured.", zap.String("domain", currentRule.Domain))
 					}
 				}
 			} else {
 				recoveryCount++
-				failCount = 0 // 恢复则重置失败计数
-				logger.Debug("Domain healthy", zap.String("domain", rule.Domain), zap.Int("recovery_count", recoveryCount), zap.Int("recovery_threshold", rule.RecoveryThreshold))
+				failCount = 0
+				logger.Debug("Domain healthy", zap.String("domain", currentRule.Domain), zap.Int("recovery_count", recoveryCount), zap.Int("recovery_threshold", currentRule.RecoveryThreshold))
 
-				// 达到恢复阈值且状态为故障
-				if recoveryCount >= rule.RecoveryThreshold && state.Status == "failed" {
+				if recoveryCount >= currentRule.RecoveryThreshold && state.Status == "failed" {
 					logger.Info("Domain reached recovery threshold, switching back to original service.",
-						zap.String("domain", rule.Domain),
+						zap.String("domain", currentRule.Domain),
 						zap.Int("recovery_count", recoveryCount),
-						zap.Int("threshold", rule.RecoveryThreshold))
-					switchBack(rule)
+						zap.Int("threshold", currentRule.RecoveryThreshold))
+					switchBack(currentRule)
 					state.Status = "normal"
-					state.Notified = false  // 恢复后重置通知状态
-					state.Confirmed = false // 恢复后重置确认状态
-					logger.Info("Traffic successfully switched back to original service.", zap.String("domain", rule.Domain))
+					state.Notified = false
+					state.Confirmed = false
+					logger.Info("Traffic successfully switched back to original service.", zap.String("domain", currentRule.Domain))
 					updateStatesToCM()
-					// 发送恢复通知
 					if telegramChatID != 0 && globalAppConfig.TelegramTemplates.RecoveryMessage != "" {
-						recoveryMsgText := fmt.Sprintf(globalAppConfig.TelegramTemplates.RecoveryMessage, rule.Domain)
-						recoveryMsg := tgbotapi.NewMessage(telegramChatID, recoveryMsgText)
-						recoveryMsg.ParseMode = "Markdown"
-						
-						// 发送恢复消息，并增加重试逻辑
-						_, sendErr := appBotApi.Send(recoveryMsg)
-						if sendErr != nil {
-							logger.Error("Initial Telegram recovery message send failed, retrying...", zap.Error(sendErr), zap.String("domain", rule.Domain))
-							retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-								_, innerSendErr := appBotApi.Send(recoveryMsg)
-								if innerSendErr != nil {
-									logger.Warn("Telegram recovery message retry failed", zap.Error(innerSendErr), zap.String("domain", rule.Domain))
-									return false, nil
-								}
-								return true, nil
-							})
-							if retryErr != nil && retryErr != context.DeadlineExceeded {
-								logger.Error("Failed to send Telegram recovery message after retries", zap.Error(retryErr), zap.String("domain", rule.Domain))
-							} else if retryErr == context.DeadlineExceeded {
-								logger.Warn("Telegram recovery message send timed out after retries", zap.String("domain", rule.Domain))
-							} else {
-								logger.Info("Telegram recovery message sent successfully after retries", zap.String("domain", rule.Domain), zap.String("message", recoveryMsgText))
-							}
-						} else {
-							logger.Info("Telegram recovery message sent immediately", zap.String("domain", rule.Domain), zap.String("message", recoveryMsgText))
-						}
+						sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.RecoveryMessage, currentRule.Domain), "Markdown")
 					}
 				}
 			}
@@ -727,9 +889,8 @@ func monitorRule(ctx context.Context, rule Rule) {
 	}
 }
 
-// checkURL 执行HTTP健康检查
 func checkURL(url string, condition string) bool {
-	client := &http.Client{Timeout: 5 * time.Second} // 5秒超时
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		logger.Debug("URL probe failed with network error", zap.String("url", url), zap.Error(err))
@@ -747,151 +908,53 @@ func checkURL(url string, condition string) bool {
 	return isHealthy
 }
 
-// sendTelegramNotification 发送Telegram故障通知
-func sendTelegramNotification(domain string) {
-	if telegramChatID == 0 || globalAppConfig.TelegramTemplates.FaultMessage == "" {
-		logger.Warn("Skipping Telegram notification: Chat ID not set or fault message template is empty.", zap.String("domain", domain))
+// sendTelegramMessage 通用函数，用于发送Telegram消息，包含重试逻辑
+func sendTelegramMessage(chatID int64, text string, parseMode string) {
+	if chatID == 0 {
+		logger.Warn("Skipping Telegram message: Chat ID is not set.", zap.String("message_text", text))
 		return
 	}
-	notificationText := fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, domain, domain, domain)
-	msg := tgbotapi.NewMessage(telegramChatID, notificationText)
-	msg.ParseMode = "Markdown" // 启用Markdown格式
+	if appBotApi == nil {
+		logger.Error("Skipping Telegram message: Bot API not initialized.", zap.String("message_text", text))
+		return
+	}
 
-	// 初始发送尝试
-	_, err := appBotApi.Send(msg) // 使用全局bot实例
-	if err != nil {
-		logger.Error("Initial Telegram notification send failed, retrying...", zap.Error(err), zap.String("domain", domain), zap.String("message", notificationText))
-		// Re-add Retry logic using wait.PollUntilContextTimeout
-		retryErr := wait.PollUntilContextTimeout(context.Background(), 5*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
-			_, sendErr := appBotApi.Send(msg)
-			if sendErr != nil {
-				logger.Warn("Telegram notification retry failed", zap.Error(sendErr), zap.String("domain", domain))
-				return false, nil // Keep retrying
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = parseMode
+
+	if _, err := appBotApi.Send(msg); err != nil {
+		logger.Error("Initial Telegram message send failed, retrying...", zap.Error(err), zap.Int64("chat_id", chatID), zap.String("message", text))
+		retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+			if _, sendErr := appBotApi.Send(msg); sendErr != nil {
+				logger.Warn("Telegram message retry failed", zap.Error(sendErr))
+				return false, nil
 			}
-			return true, nil // Success
+			return true, nil
 		})
-
 		if retryErr != nil && retryErr != context.DeadlineExceeded {
-			logger.Error("Failed to send Telegram notification after retries", zap.Error(retryErr), zap.String("domain", domain))
+			logger.Error("Failed to send Telegram message after retries", zap.Error(retryErr), zap.Int64("chat_id", chatID))
 		} else if retryErr == context.DeadlineExceeded {
-			logger.Error("Telegram notification send timed out after retries", zap.String("domain", domain))
+			logger.Warn("Telegram message send timed out after retries", zap.Int64("chat_id", chatID))
 		} else {
-			logger.Info("Telegram notification sent successfully after retries", zap.String("domain", domain), zap.String("message", notificationText))
+			logger.Info("Telegram message sent successfully after retries", zap.String("message", text))
 		}
 	} else {
-		logger.Info("Telegram notification sent immediately", zap.String("domain", domain), zap.String("message", notificationText))
+		logger.Info("Telegram message sent immediately", zap.String("message", text))
 	}
 }
 
-// telegramCallbackHandler 处理Telegram的webhook回调
-func telegramCallbackHandler(w http.ResponseWriter, r *http.Request) {
-	var update tgbotapi.Update
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		logger.Error("Failed to decode Telegram webhook update", zap.Error(err))
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		return
-	}
-	// 确保是消息更新并且有文本内容
-	if update.Message == nil || update.Message.Text == "" {
-		logger.Debug("Received non-message or empty message Telegram update, ignoring.")
-		return
-	}
-
-	text := update.Message.Text
-	chatID := update.Message.Chat.ID
-	logger.Info("Received Telegram message", zap.String("from", update.Message.From.UserName), zap.String("text", text), zap.Int64("chat_id", chatID))
-
-	var replyText string
-	if strings.HasPrefix(text, "/confirm_") {
-		domain := strings.TrimPrefix(text, "/confirm_")
-		stateI, ok := states.Load(domain)
-		if ok {
-			state := stateI.(*State)
-			if state.Status == "normal" {
-				replyText = fmt.Sprintf("ℹ️ Domain `%s` is currently healthy. No action needed.", domain)
-			} else {
-				state.Confirmed = true
-				updateStatesToCM()
-				logger.Info("Traffic switch confirmed by Telegram user", zap.String("domain", domain), zap.String("user", update.Message.From.UserName))
-				replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ConfirmReply, domain)
-				// 立即触发一次切换，而不是等待下一个监控周期
-				if state.Status != "failed" { // 只有在已检测到故障时才立即切换
-					mu.RLock()
-					currentRules := rules
-					mu.RUnlock()
-					for _, rule := range currentRules {
-						if rule.Domain == domain {
-							switchToMaintenance(rule)
-							break
-						}
-					}
-				}
-			}
-		} else {
-			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", domain)
-		}
-	} else if strings.HasPrefix(text, "/manual_") {
-		domain := strings.TrimPrefix(text, "/manual_")
-		stateI, ok := states.Load(domain)
-		if ok {
-			state := stateI.(*State)
-			state.Confirmed = false
-			state.Notified = false // 允许重新通知
-			updateStatesToCM()
-			logger.Info("Manual mode enabled by Telegram user", zap.String("domain", domain), zap.String("user", update.Message.From.UserName))
-			replyText = fmt.Sprintf(globalAppConfig.TelegramTemplates.ManualReply, domain)
-			// 如果服务已在维护模式，则回切
-			if state.Status == "failed" {
-				mu.RLock()
-				currentRules := rules
-				mu.RUnlock()
-				for _, rule := range currentRules {
-					if rule.Domain == domain {
-						switchBack(rule)
-						break
-					}
-				}
-			}
-		} else {
-			replyText = fmt.Sprintf("⚠️ No active rule found for domain: `%s`.", domain)
-		}
-	} else {
-		replyText = "Hello! I am Traffic Switcher bot. You can interact with me to manage traffic for your domains. Try `/confirm_yourdomain` or `/manual_yourdomain`."
-	}
-
-	// 回复Telegram用户，并增加重试逻辑
-	if replyText != "" {
-		replyMsg := tgbotapi.NewMessage(chatID, replyText)
-		replyMsg.ParseMode = "Markdown"
-		_, err := appBotApi.Send(replyMsg) // 使用全局bot实例
-		if err != nil {
-			logger.Error("Initial Telegram reply send failed, retrying...", zap.Error(err), zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
-			retryErr := wait.PollUntilContextTimeout(context.Background(), 3*time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-				_, sendErr := appBotApi.Send(replyMsg)
-				if sendErr != nil {
-					logger.Warn("Telegram reply retry failed", zap.Error(sendErr), zap.Int64("chat_id", chatID))
-					return false, nil // Keep retrying
-				}
-				return true, nil // Success
-			})
-			if retryErr != nil && retryErr != context.DeadlineExceeded {
-				logger.Error("Failed to send Telegram reply after retries", zap.Error(retryErr), zap.Int64("chat_id", chatID))
-			} else if retryErr == context.DeadlineExceeded {
-				logger.Warn("Telegram reply send timed out after retries", zap.Int64("chat_id", chatID))
-			} else {
-				logger.Info("Telegram reply sent successfully after retries", zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
-			}
-		} else {
-			logger.Info("Telegram reply sent immediately", zap.Int64("chat_id", chatID), zap.String("reply_text", replyText))
-		}
-	}
-	w.WriteHeader(http.StatusOK) // 总是返回200 OK给Telegram
+// sendTelegramNotification 是一个过时函数，调用通用的sendTelegramMessage
+// 保持它只是为了兼容之前monitorRule里的调用，可以考虑直接替换掉
+// 此函数会被monitorRule调用，如果不想看到弃用警告，可以直接在monitorRule中替换调用
+func sendTelegramNotification(domain string) {
+	logger.Debug("Deprecated sendTelegramNotification called. Use sendTelegramMessage directly.", zap.String("domain", domain))
+	sendTelegramMessage(telegramChatID, fmt.Sprintf(globalAppConfig.TelegramTemplates.FaultMessage, domain, domain, domain), "Markdown")
 }
 
-// switchToMaintenance 将服务的Endpoints指向维护Pod的IP
+
 func switchToMaintenance(rule Rule) {
 	mu.RLock()
-	ips := podIPs // 获取当前所有traffic-switcher Pod的IPs
+	ips := podIPs
 	mu.RUnlock()
 
 	if len(ips) == 0 {
@@ -914,34 +977,28 @@ func switchToMaintenance(rule Rule) {
 				continue
 			}
 
-			// 如果原始Endpoints尚未保存，则保存一份
 			if _, loaded := originalEndpoints.Load(key); !loaded {
 				original, marshalErr := json.Marshal(ep.Subsets)
 				if marshalErr != nil {
 					logger.Error("Failed to marshal original Endpoints subsets for service", zap.String("service", fullSvcName), zap.Error(marshalErr))
-					// 继续执行，但不保存原始Endpoints可能会导致回切失败
 				} else {
 					originalEndpoints.Store(key, original)
 					logger.Debug("Original Endpoints saved for service", zap.String("service", fullSvcName))
 				}
 			}
 
-			// 构建指向维护Pod的Endpoints
 			var addresses []corev1.EndpointAddress
 			for _, ip := range ips {
 				addresses = append(addresses, corev1.EndpointAddress{IP: ip})
 			}
-			// 假设所有服务都有至少一个EndpointSubset，并且端口配置是通用的
-			// 注意：这里简单复制第一个Subset的端口，实际可能需要更复杂的端口映射逻辑
 			var newSubsets []corev1.EndpointSubset
 			if len(ep.Subsets) > 0 {
 				newSubsets = []corev1.EndpointSubset{{
 					Addresses: addresses,
-					Ports:     ep.Subsets[0].Ports, // 复制第一个子集的端口
+					Ports:     ep.Subsets[0].Ports,
 				}}
 			} else {
-				// 如果没有现有端口，无法确定维护页面的端口，这是一个潜在问题
-				logger.Error("Service has no existing EndpointSubset, cannot determine ports for maintenance page.", zap.String("service", fullSvcName))
+				logger.Error("Service has no existing EndpointSubset, cannot determine ports for maintenance page. Please ensure service has endpoints before switching.", zap.String("service", fullSvcName))
 				continue
 			}
 
@@ -951,7 +1008,6 @@ func switchToMaintenance(rule Rule) {
 				continue
 			}
 
-			// 使用重试机制更新Endpoints
 			err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				_, patchErr := clientset.CoreV1().Endpoints(svcNS.Namespace).Patch(context.Background(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
 				return patchErr
@@ -963,10 +1019,9 @@ func switchToMaintenance(rule Rule) {
 			}
 		}
 	}
-	updateStatesToCM() // 更新状态到ConfigMap，包括保存的原始Endpoints
+	updateStatesToCM()
 }
 
-// switchBack 将服务的Endpoints恢复到原始状态
 func switchBack(rule Rule) {
 	for _, svcNS := range rule.Services {
 		for _, svc := range svcNS.SvcNames {
@@ -976,21 +1031,19 @@ func switchBack(rule Rule) {
 				zap.String("domain", rule.Domain),
 				zap.String("service", fullSvcName))
 
-			originalI, ok := originalEndpoints.LoadAndDelete(key) // 获取并移除原始Endpoints
+			originalI, ok := originalEndpoints.LoadAndDelete(key)
 			if !ok {
-				logger.Warn("No original endpoints found in cache for service, cannot switch back.", zap.String("service", fullSvcName))
+				logger.Warn("No original endpoints found in cache for service, cannot switch back. This might indicate an issue or that the service was never switched.", zap.String("service", fullSvcName))
 				continue
 			}
-			original := originalI.([]byte) // 原始Endpoints的JSON字节数据
+			original := originalI.([]byte)
 
-			// 构建patch数据，恢复原始subsets
 			patchData, marshalErr := json.Marshal(map[string]interface{}{"subsets": json.RawMessage(original)})
 			if marshalErr != nil {
 				logger.Error("Failed to marshal patch data for reverting service", zap.String("service", fullSvcName), zap.Error(marshalErr))
 				continue
 			}
 
-			// 使用重试机制更新Endpoints
 			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				_, patchErr := clientset.CoreV1().Endpoints(svcNS.Namespace).Patch(context.Background(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
 				return patchErr
@@ -1002,10 +1055,9 @@ func switchBack(rule Rule) {
 			}
 		}
 	}
-	updateStatesToCM() // 更新状态到ConfigMap
+	updateStatesToCM()
 }
 
-// maintenanceHandler 处理HTTP请求，返回维护页面
 func maintenanceHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
 	tmpl := htmlTemplate
@@ -1018,8 +1070,7 @@ func maintenanceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := map[string]string{
-		"Domain": r.Host, // 动态显示访问的域名
-		// 可以添加更多动态数据
+		"Domain": r.Host,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1033,7 +1084,6 @@ func maintenanceHandler(w http.ResponseWriter, r *http.Request) {
 	logger.Debug("Maintenance page served", zap.String("host", r.Host), zap.String("path", r.URL.Path))
 }
 
-// healthHandler 提供健康检查端点
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
