@@ -6,7 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
-	"io/ioutil"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,7 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	"k8s.io/api/coordination/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -134,7 +135,11 @@ func main() {
 	http.HandleFunc("/callback", telegramCallbackHandler)
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/healthz", healthHandler)
-	go http.ListenAndServe(":8080", nil) // Change to 8080 for probe
+	go func() {
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			logger.Fatal("HTTP server failed", zap.Error(err))
+		}
+	}()
 
 	// Watch files
 	go watchConfigFile()
@@ -232,11 +237,11 @@ func loadHTML() {
 }
 
 func loadStatesFromCM() {
-	cm, err := clientset.CoreV1().ConfigMaps(programNamespace).Get(context.TODO(), stateConfigMap, metav1.GetOptions{})
+	cm, err := clientset.CoreV1().ConfigMaps(programNamespace).Get(context.Background(), stateConfigMap, metav1.GetOptions{})
 	if err != nil {
 		logger.Info("No state CM, creating")
 		// Create if not exist
-		_, err = clientset.CoreV1().ConfigMaps(programNamespace).Create(context.TODO(), &corev1.ConfigMap{
+		_, err = clientset.CoreV1().ConfigMaps(programNamespace).Create(context.Background(), &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: stateConfigMap},
 			Data:       make(map[string]string),
 		}, metav1.CreateOptions{})
@@ -276,7 +281,7 @@ func updateStatesToCM() {
 
 	patch, _ := json.Marshal(map[string]interface{}{"data": cmData})
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		_, err := clientset.CoreV1().ConfigMaps(programNamespace).Patch(context.TODO(), stateConfigMap, types.MergePatchType, patch, metav1.PatchOptions{})
+		_, err := clientset.CoreV1().ConfigMaps(programNamespace).Patch(context.Background(), stateConfigMap, types.MergePatchType, patch, metav1.PatchOptions{})
 		return err
 	})
 	if err != nil {
@@ -349,7 +354,7 @@ func watchOwnPods() {
 }
 
 func updatePodIPs() {
-	pods, err := clientset.CoreV1().Pods(programNamespace).List(context.TODO(), metav1.ListOptions{
+	pods, err := clientset.CoreV1().Pods(programNamespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=traffic-switcher",
 	})
 	if err != nil {
@@ -504,7 +509,7 @@ func switchToMaintenance(rule Rule) {
 	for _, svcNS := range rule.Services {
 		for _, svc := range svcNS.SvcNames {
 			key := fmt.Sprintf("%s-%s", svcNS.Namespace, svc)
-			ep, err := clientset.CoreV1().Endpoints(svcNS.Namespace).Get(context.TODO(), svc, metav1.GetOptions{})
+			ep, err := clientset.CoreV1().Endpoints(svcNS.Namespace).Get(context.Background(), svc, metav1.GetOptions{})
 			if err != nil {
 				logger.Error("Get ep failed", zap.Error(err))
 				continue
@@ -522,7 +527,7 @@ func switchToMaintenance(rule Rule) {
 			}}
 			patchData, _ := json.Marshal(map[string]interface{}{"subsets": subsets})
 			err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				_, err := clientset.CoreV1().Endpoints(svcNS.Namespace).Patch(context.TODO(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
+				_, err := clientset.CoreV1().Endpoints(svcNS.Namespace).Patch(context.Background(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
 				return err
 			})
 			if err != nil {
@@ -547,7 +552,7 @@ func switchBack(rule Rule) {
 			original := originalI.([]byte)
 			patchData, _ := json.Marshal(map[string]interface{}{"subsets": json.RawMessage(original)})
 			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				_, err := clientset.CoreV1().Endpoints(svcNS.Namespace).Patch(context.TODO(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
+				_, err := clientset.CoreV1().Endpoints(svcNS.Namespace).Patch(context.Background(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
 				return err
 			})
 			if err != nil {
@@ -561,26 +566,26 @@ func switchBack(rule Rule) {
 }
 
 func maintenanceHandler(w http.ResponseWriter, r *http.Request) {
-    mu.RLock()
-    tmpl := htmlTemplate
-    mu.RUnlock()
+	mu.RLock()
+	tmpl := htmlTemplate
+	mu.RUnlock()
 
-    if tmpl == nil {
-        http.Error(w, "Maintenance page template not loaded", http.StatusInternalServerError)
-        return
-    }
+	if tmpl == nil {
+		http.Error(w, "Maintenance page template not loaded", http.StatusInternalServerError)
+		return
+	}
 
-    data := map[string]string{
-        "Domain": r.Host,
-    }
+	data := map[string]string{
+		"Domain": r.Host,
+	}
 
-    if err := tmpl.Execute(w, data); err != nil {
-        logger.Error("Failed to render maintenance page",
-            zap.String("host", r.Host),
-            zap.Error(err))
-        http.Error(w, "Failed to render maintenance page", http.StatusInternalServerError)
-        return
-    }
+	if err := tmpl.Execute(w, data); err != nil {
+		logger.Error("Failed to render maintenance page",
+			zap.String("host", r.Host),
+			zap.Error(err))
+		http.Error(w, "Failed to render maintenance page", http.StatusInternalServerError)
+		return
+	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
