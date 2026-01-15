@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,7 +22,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -34,7 +34,6 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog/v2"
 )
 
 type Rule struct {
@@ -67,7 +66,7 @@ var (
 	configPath        = "/config/rules.yaml"
 	htmlPath          = "/config/maintenance.html"
 	telegramToken     = os.Getenv("TELEGRAM_BOT_TOKEN")
-	telegramChatIDStr = os.Getenv("TELEGRAM_CHAT_ID"
+	telegramChatIDStr = os.Getenv("TELEGRAM_CHAT_ID") // 修复：添加了缺失的括号
 	telegramChatID    int64
 	rules             []Rule
 	states            sync.Map // domain -> *State
@@ -81,7 +80,7 @@ var (
 	probeSuccess      = prometheus.NewGauge(prometheus.GaugeOpts{Name: "probe_success_rate", Help: "URL probe success rate"})
 	probeFailure      = prometheus.NewCounter(prometheus.CounterOpts{Name: "probe_failure_count", Help: "Number of probe failures"})
 	switchCount       = prometheus.NewCounter(prometheus.CounterOpts{Name: "switch_count", Help: "Number of traffic switches"})
-	stateConfigMap    = "traffic-switch-states" // Persistent state CM
+	stateConfigMap    = "traffic-switch-states"    // Persistent state CM
 	programNamespace  = os.Getenv("POD_NAMESPACE") // Set in Deployment
 	programPodName    = os.Getenv("POD_NAME")
 	leaderLeaseName   = "traffic-switcher-leader"
@@ -97,8 +96,10 @@ func init() {
 	if telegramChatIDStr != "" {
 		telegramChatID, err = strconv.ParseInt(telegramChatIDStr, 10, 64)
 		if err != nil {
-			logger.Fatal("Invalid TELEGRAM_CHAT_ID", zap.Error(err))
+			logger.Fatal("Invalid TELEGRAM_CHAT_ID format", zap.Error(err))
 		}
+	} else {
+		logger.Warn("TELEGRAM_CHAT_ID is empty")
 	}
 	if programNamespace == "" {
 		programNamespace = "default"
@@ -180,11 +181,37 @@ func run(ctx context.Context) {
 	// Watch own Pods
 	go watchOwnPods()
 
-	// Telegram bot
+	// ---------------------------------------------------------
+	// 优化：Telegram 初始化与验证逻辑
+	// ---------------------------------------------------------
 	bot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
-		logger.Fatal("Failed bot API", zap.Error(err))
+		logger.Fatal("Failed to initialize Telegram Bot API. Check TELEGRAM_BOT_TOKEN.", zap.Error(err))
 	}
+
+	// 1. 验证 Token 有效性 (GetMe)
+	botUser, err := bot.GetMe()
+	if err != nil {
+		logger.Fatal("Telegram Token is invalid or API is unreachable", zap.Error(err))
+	}
+	logger.Info("Telegram Bot connected successfully", zap.String("bot_username", botUser.UserName))
+
+	// 2. 发送启动消息验证 ChatID 是否正确
+	if telegramChatID != 0 {
+		startupMsg := tgbotapi.NewMessage(telegramChatID, fmt.Sprintf("🚀 **Traffic Switcher Started**\n\nPod: `%s`\nNamespace: `%s`\nStatus: Leader Acquired", programPodName, programNamespace))
+		startupMsg.ParseMode = "Markdown"
+		_, err = bot.Send(startupMsg)
+		if err != nil {
+			logger.Error("Failed to send startup message. Check TELEGRAM_CHAT_ID or Bot permissions.",
+				zap.Error(err),
+				zap.Int64("chat_id", telegramChatID))
+		} else {
+			logger.Info("Telegram startup message sent successfully")
+		}
+	} else {
+		logger.Warn("Skipping Telegram startup message: TELEGRAM_CHAT_ID not set")
+	}
+	// ---------------------------------------------------------
 
 	// Start monitoring
 	cancelCtx, cancel := context.WithCancel(ctx)
@@ -407,9 +434,15 @@ func monitorRule(ctx context.Context, bot *tgbotapi.BotAPI, rule Rule) {
 			return
 		case <-ticker.C:
 			healthy := false
-			retry.BackoffUntil(func() {
-				healthy = checkURL(rule.CheckURL, rule.CheckCondition)
-			}, retry.NewBackoff(), 3, time.Second)
+			// 修复：使用简单的重试循环代替错误的 BackoffUntil 调用
+			for i := 0; i < 3; i++ {
+				if checkURL(rule.CheckURL, rule.CheckCondition) {
+					healthy = true
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+
 			if healthy {
 				probeSuccess.Set(1)
 			} else {
@@ -464,11 +497,12 @@ func checkURL(url string, condition string) bool {
 }
 
 func sendTelegramNotification(bot *tgbotapi.BotAPI, domain string) {
-	msg := tgbotapi.NewMessage(telegramChatID, fmt.Sprintf("Domain %s fault. Confirm switch? /confirm_%s or /manual_%s", domain, domain, domain))
+	msg := tgbotapi.NewMessage(telegramChatID, fmt.Sprintf("🚨 **Domain Fault**: %s\n\nConfirm switch? /confirm_%s or /manual_%s", domain, domain, domain))
+	msg.ParseMode = "Markdown"
 	_, err := bot.Send(msg)
 	if err != nil {
 		logger.Error("Send notification failed", zap.Error(err))
-		// Retry logic
+		// Retry logic: 使用 Poll 确保消息发送
 		wait.Poll(5*time.Second, 1*time.Minute, func() (bool, error) {
 			_, err = bot.Send(msg)
 			return err == nil, nil
@@ -495,6 +529,11 @@ func telegramCallbackHandler(w http.ResponseWriter, r *http.Request) {
 			state.Confirmed = true
 			updateStatesToCM()
 			logger.Info("Confirmed switch", zap.String("domain", domain))
+			
+			// 反馈用户
+			reply := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("✅ Switching traffic for %s to maintenance page.", domain))
+			bot, _ := tgbotapi.NewBotAPI(telegramToken) // 这里为了简单重新创建bot实例，实际上最好传递进来
+			if bot != nil { bot.Send(reply) }
 		}
 	} else if strings.HasPrefix(text, "/manual_") {
 		domain := strings.TrimPrefix(text, "/manual_")
@@ -505,6 +544,11 @@ func telegramCallbackHandler(w http.ResponseWriter, r *http.Request) {
 			state.Notified = false // Allow re-notify if needed
 			updateStatesToCM()
 			logger.Info("Manual mode", zap.String("domain", domain))
+			
+			// 反馈用户
+			reply := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("🔧 Manual mode enabled for %s. Will re-notify on failure.", domain))
+			bot, _ := tgbotapi.NewBotAPI(telegramToken)
+			if bot != nil { bot.Send(reply) }
 		}
 	}
 }
