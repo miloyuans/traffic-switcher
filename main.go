@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"log" // 依然需要，因为zap的初始化需要
+	"net"
 	"net/http"
 	"os"
 	"os/signal" // Used for graceful shutdown in main
@@ -36,6 +37,7 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/util/retry"
+	"net/url" // 新增：用于解析URL
 )
 
 // TelegramTemplates 定义了Telegram通知消息的模板
@@ -62,12 +64,12 @@ type GlobalConfig struct {
 type Rule struct {
 	Domain            string      `yaml:"domain" json:"domain"`
 	CheckURL          string      `yaml:"check_url" json:"check_url"`
-	CheckCondition    string      `yaml:"check_condition" json:"check_condition"`
+	CheckCondition    string      `yaml:"check_condition" json:"check_condition"` // 保留但未使用，因为改为TCP探测
 	FailThreshold     int         `yaml:"fail_threshold" json:"fail_threshold"`
 	RecoveryThreshold int         `yaml:"recovery_threshold" json:"recovery_threshold"`
 	CheckInterval     string      `yaml:"check_interval" json:"check_interval"`
 	ForceSwitch       bool        `yaml:"force_switch" json:"force_switch"` // 新增：每域名独立强制切换开关
-	MaintenanceLabel  string      `yaml:"maintenance_pod_label" json:"maintenance_pod_label"`
+	MaintenanceLabel  string      `yaml:"maintenance_pod_label" json:"maintenance_pod_label"` // 未使用，保留以兼容
 	Services          []ServiceNS `yaml:"services" json:"services"`
 }
 
@@ -485,7 +487,7 @@ func loadConfig() {
 		globalAppConfig.HTTPListenAddr = "0.0.0.0"
 	}
 	if globalAppConfig.HTTPListenPort == "" {
-		globalAppConfig.HTTPListenPort = "8080"
+		globalAppConfig.HTTPListenPort = "80" // 修改默认端口为80，以匹配维护页暴露
 	}
 
 	// 设置Telegram模板的默认值
@@ -890,15 +892,7 @@ func monitorRule(ctx context.Context, rule Rule) { // rule 现在是副本
 			}
 
 			// 以下是正常模式下的健康检查和状态管理逻辑
-			healthy := false
-			for i := 0; i < 3; i++ {
-				if checkURL(currentRule.CheckURL, currentRule.CheckCondition) {
-					healthy = true
-					break
-				}
-				logger.Debug("URL probe retry", zap.String("domain", currentRule.Domain), zap.String("url", currentRule.CheckURL), zap.Int("attempt", i+1))
-				time.Sleep(1 * time.Second)
-			}
+			healthy := checkURL(currentRule.CheckURL, currentRule.CheckCondition) // 去除重试，只一次探测
 
 			if healthy {
 				probeSuccess.Set(1)
@@ -976,23 +970,32 @@ func monitorRule(ctx context.Context, rule Rule) { // rule 现在是副本
 	}
 }
 
-func checkURL(url string, condition string) bool {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
+func checkURL(urlStr string, condition string) bool { // condition未使用，仅保留兼容
+	u, err := url.Parse(urlStr)
 	if err != nil {
-		logger.Debug("URL probe failed with network error", zap.String("url", url), zap.Error(err))
+		logger.Debug("Failed to parse URL for TCP probe", zap.String("url", urlStr), zap.Error(err))
 		return false
 	}
-	defer resp.Body.Close()
 
-	isHealthy := strings.Contains(condition, fmt.Sprintf("%d", resp.StatusCode))
-	logger.Debug("URL probe completed",
-		zap.String("url", url),
-		zap.Int("status_code", resp.StatusCode),
-		zap.String("expected_condition", condition),
-		zap.Bool("is_healthy", isHealthy))
+	host := u.Hostname()
+	portStr := u.Port()
+	if portStr == "" {
+		if u.Scheme == "https" {
+			portStr = "443"
+		} else {
+			portStr = "80"
+		}
+	}
+	addr := net.JoinHostPort(host, portStr)
 
-	return isHealthy
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		logger.Debug("TCP probe failed", zap.String("addr", addr), zap.Error(err))
+		return false
+	}
+	conn.Close()
+	logger.Debug("TCP probe successful", zap.String("addr", addr))
+	return true
 }
 
 // sendTelegramMessage 通用函数，用于发送Telegram消息，包含重试逻辑
