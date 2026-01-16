@@ -4,6 +4,7 @@ import (
     "flag"
     "os"
     "os/signal"
+	"sync"
 
     "k8s.io/client-go/kubernetes"
     "k8s.io/client-go/rest"
