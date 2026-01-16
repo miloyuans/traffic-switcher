@@ -31,9 +31,10 @@ func main() {
     }
 
     ctrl := &Controller{
-        clientset: clientset,
-        pending:   sync.Map{},
-    }
+		clientset:  clientset,
+		pending:    sync.Map{},
+		configPath: *configPath,  // 新增这一行
+	}
 
     // 加载初始配置
     if err := ctrl.LoadConfig(*configPath); err != nil {

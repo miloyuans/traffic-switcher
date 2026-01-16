@@ -4,7 +4,8 @@ import (
     "fmt"
     "time"
 
-    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+    "github.com/google/uuid"                                      // 解决 undefined: uuid
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // tgbotapi
     "k8s.io/klog/v2"
 )
 

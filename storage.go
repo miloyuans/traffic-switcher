@@ -7,6 +7,8 @@ import (
     "go.mongodb.org/mongo-driver/bson"
     "go.mongodb.org/mongo-driver/mongo"
     "go.mongodb.org/mongo-driver/mongo/options"
+
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"  // Get/Update 需要 metav1.GetOptions{}
     "k8s.io/klog/v2"
 )
 

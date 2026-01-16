@@ -4,13 +4,16 @@ import (
     "context"
     "io"
     "net/http"
-    "os"
+    "os"       // 新增（可能用到）
     "sync"
     "time"
 
     "github.com/fsnotify/fsnotify"
-    "github.com/google/uuid"
     "gopkg.in/yaml.v3"
+
+    "k8s.io/client-go/kubernetes"                  // 解决 undefined: kubernetes
+    "go.mongodb.org/mongo-driver/mongo"            // 解决 undefined: mongo
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // 解决 undefined: tgbotapi
     "k8s.io/klog/v2"
 )
 
@@ -22,6 +25,7 @@ type Controller struct {
     mongoClient *mongo.Client
     tgBot       *tgbotapi.BotAPI
     pending     sync.Map // string(uuid) -> chan bool
+    configPath  string   // 新增：配置文件路径，用于写回 force_switch
 }
 
 func (c *Controller) LoadConfig(path string) error {
@@ -109,24 +113,19 @@ func (c *Controller) probeAndAct(rule *RuleRuntime) {
 
     ok := c.probeURL(rule.Config.Domain, expected)
 
-    // 记录状态用于判断是否需要恢复
-    if ok {
-        rule.LastProbeOK = true
-    } else {
-        rule.LastProbeOK = false
-    }
+    prevOK := rule.LastProbeOK
+    rule.LastProbeOK = ok
 
-    // 强制开关优先
+    // 强制开关优先（但不 return，让其继续判断恢复）
     if rule.Config.ForceSwitch {
         c.requestFailover(rule, "force_switch")
-        return
     }
 
     if !ok {
         c.requestFailover(rule, "health_check_failed")
-    } else if !rule.LastProbeOK && rule.IsSwitched { // 从失败恢复到正常，且已切换
+    } else if ok && !prevOK && rule.IsSwitched {
+        // 从异常恢复到正常，且已切换 → 触发恢复
         c.requestRecovery(rule)
-        // 恢复成功后如果是从强制触发的，关闭开关（写文件）
         go c.disableForceSwitchIfNeeded(rule)
     }
 }

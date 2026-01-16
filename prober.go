@@ -2,12 +2,15 @@ package main
 
 import (
     "context"
+    "fmt"
     "os"
-    "sync"
 
-    "k8s.io/apimachinery/pkg/apis/meta/v1"
-    "k8s.io/klog/v2"
     "gopkg.in/yaml.v3"
+
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"                  // 解决 undefined: metav1
+    "k8s.io/klog/v2"
+
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // 解决 undefined: tgbotapi
 )
 
 func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
@@ -91,7 +94,7 @@ func (c *Controller) disableForceSwitchIfNeeded(rule *RuleRuntime) {
         }
     }
     data, _ := yaml.Marshal(c.config)
-    os.WriteFile(*configPath, data, 0644)
+    os.WriteFile(c.configPath, data, 0644)
     c.mu.Unlock()
 
     c.tgBot.Send(tgbotapi.NewMessage(c.config.Global.Telegram.ChatID, fmt.Sprintf("强制切换开关已自动关闭: %s", rule.Config.Domain)))
