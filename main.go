@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,10 +24,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 )
 
 type Config struct {
@@ -51,24 +52,26 @@ type Config struct {
 		MaintenanceService   string `yaml:"maintenance_service"`   // 维护页服务名称
 
 		Targets []struct {
-			Namespace string `yaml:"namespace"`
-			Service   string `yaml:"service"` // 要被劫持的目标服务
+			Namespace string   `yaml:"namespace"`
+			Services  []string `yaml:"services"` // 支持多个 svc per namespace
 		} `yaml:"targets"`
 	} `yaml:"switch"`
 }
 
 var (
-	configPath            = "/config/config.yaml"
-	config                Config
-	clientset             *kubernetes.Clientset
-	bot                   *tgbotapi.BotAPI
-	mu                    sync.RWMutex
-	htmlTemplate          *template.Template
-	logger                = log.New(os.Stdout, "[traffic-switcher] ", log.LstdFlags|log.Lmicroseconds)
-	originalSubsets       sync.Map // key: "ns/svc" → []corev1.EndpointSubset
-	watchStopChs          sync.Map // key: "ns/svc" → chan struct{}
-	maintenanceSubsets    []corev1.EndpointSubset // 当前维护页的 subsets（缓存）
-	maintenanceSubsetsMtx sync.Mutex
+	configPath   = "/config/config.yaml"
+	config       Config
+	clientset    *kubernetes.Clientset
+	bot          *tgbotapi.BotAPI
+	mu           sync.RWMutex
+	htmlTemplate *template.Template
+	logger       = log.New(os.Stdout, "[traffic-switcher] ", log.LstdFlags)
+
+	// 用于存储每个目标服务的原始 subsets
+	originalSubsets sync.Map // key: "ns/svc" value: []corev1.EndpointSubset
+
+	// 监控停止通道
+	stopCh sync.Map // key: "ns/svc" → chan struct{}
 )
 
 func main() {
@@ -100,27 +103,30 @@ func main() {
 	go startHTTPServer()
 
 	// 监听配置文件变化
-	go watchConfigFile()
+	go watchConfig()
 
-	// 监听系统信号优雅退出
+	// 等待系统信号退出
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
 	logger.Println("Shutting down...")
-	stopAllWatchers()
+	// 停止所有监控
+	stopCh.Range(func(k, v interface{}) bool {
+		close(v.(chan struct{}))
+		return true
+	})
 }
 
 func loadConfig() {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		logger.Printf("Failed to read config: %v", err)
+		logger.Printf("Failed to read config file: %v", err)
 		return
 	}
-
 	var newConfig Config
-	if err := yaml.Unmarshal(data, &newConfig); err != nil {
-		logger.Printf("Failed to parse config yaml: %v", err)
+	if err = yaml.Unmarshal(data, &newConfig); err != nil {
+		logger.Printf("Failed to parse config file: %v", err)
 		return
 	}
 
@@ -129,7 +135,7 @@ func loadConfig() {
 	config = newConfig
 	mu.Unlock()
 
-	// 默认值补全
+	// 默认值
 	if config.HTTP.ListenAddr == "" {
 		config.HTTP.ListenAddr = "0.0.0.0"
 	}
@@ -146,35 +152,29 @@ func loadConfig() {
 		config.Switch.MaintenanceService = "traffic-switcher"
 	}
 
-	// 重新加载维护页面模板
 	loadHTMLTemplate()
 
-	// 初始化/更新 Telegram Bot
+	// 初始化 Telegram Bot
 	if config.Telegram.Token != "" && config.Telegram.ChatID != 0 {
-		var botErr error
-		bot, botErr = tgbotapi.NewBotAPI(config.Telegram.Token)
-		if botErr != nil {
-			logger.Printf("Failed to init telegram bot: %v", botErr)
+		bot, err = tgbotapi.NewBotAPI(config.Telegram.Token)
+		if err != nil {
+			logger.Printf("Failed to initialize Telegram Bot: %v", err)
 			bot = nil
 		} else {
-			logger.Printf("Telegram bot initialized: @%s", bot.Self.UserName)
+			logger.Printf("Telegram Bot initialized: @%s", bot.Self.UserName)
 		}
 	}
 
-	// 缓存当前维护服务的 endpoints subsets
-	updateMaintenanceSubsets()
-
-	// 开关变化处理
 	shouldSwitch := config.Switch.ForceSwitch
 
 	if shouldSwitch && !oldForce {
-		logger.Println("Force switch turned ON → switching to maintenance")
+		logger.Println("Force switch enabled, starting switch to maintenance...")
 		switchToMaintenance()
-		sendTelegram("🚧 **Maintenance mode ACTIVATED**")
+		sendTelegram("🚧 **Maintenance mode ON**")
 	} else if !shouldSwitch && oldForce {
-		logger.Println("Force switch turned OFF → recovering original traffic")
+		logger.Println("Force switch disabled, recovering original...")
 		recoverOriginal()
-		sendTelegram("✅ **Maintenance mode DEACTIVATED**, traffic recovered")
+		sendTelegram("✅ **Maintenance mode OFF**")
 	}
 }
 
@@ -184,77 +184,52 @@ func loadHTMLTemplate() {
 
 	tmpl, err := template.ParseFiles(config.Maintenance.HTMLPath)
 	if err != nil {
-		logger.Printf("Failed to load maintenance template %s: %v", config.Maintenance.HTMLPath, err)
+		logger.Printf("Failed to load HTML template: %v", err)
 		htmlTemplate = nil
 		return
 	}
 	htmlTemplate = tmpl
-	logger.Printf("Maintenance HTML loaded: %s", config.Maintenance.HTMLPath)
-}
-
-func updateMaintenanceSubsets() {
-	maintenanceSubsetsMtx.Lock()
-	defer maintenanceSubsetsMtx.Unlock()
-
-	ep, err := clientset.CoreV1().Endpoints(config.Switch.MaintenanceNamespace).Get(
-		context.Background(),
-		config.Switch.MaintenanceService,
-		metav1.GetOptions{},
-	)
-	if err != nil {
-		logger.Printf("Failed to get maintenance endpoints %s/%s: %v",
-			config.Switch.MaintenanceNamespace, config.Switch.MaintenanceService, err)
-		return
-	}
-
-	if len(ep.Subsets) == 0 {
-		logger.Println("Warning: maintenance service has no endpoints subsets")
-		maintenanceSubsets = nil
-		return
-	}
-
-	maintenanceSubsets = ep.Subsets
-	logger.Printf("Maintenance subsets updated (count: %d)", len(maintenanceSubsets))
+	logger.Println("HTML template loaded successfully")
 }
 
 func startHTTPServer() {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		mu.RLock()
-		tmpl := htmlTemplate
-		mu.RUnlock()
-
-		if tmpl == nil {
-			http.Error(w, "Maintenance page not available", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = tmpl.Execute(w, nil)
-	})
-
+	http.HandleFunc("/", maintenanceHandler)
 	addr := fmt.Sprintf("%s:%s", config.HTTP.ListenAddr, config.HTTP.Port)
-	logger.Printf("Starting HTTP server on %s", addr)
-
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	logger.Printf("HTTP server starting on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
 		logger.Fatalf("HTTP server failed: %v", err)
 	}
 }
 
-func watchConfigFile() {
+func maintenanceHandler(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	tmpl := htmlTemplate
+	mu.RUnlock()
+
+	if tmpl == nil {
+		http.Error(w, "Maintenance page not loaded", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tmpl.Execute(w, nil); err != nil {
+		logger.Printf("Failed to execute template: %v", err)
+		http.Error(w, "Template execution failed", http.StatusInternalServerError)
+		return
+	}
+}
+
+func watchConfig() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		logger.Fatalf("Failed to create fsnotify watcher: %v", err)
+		logger.Fatalf("Failed to create watcher: %v", err)
 	}
 	defer watcher.Close()
 
 	dir := filepath.Dir(configPath)
 	if err := watcher.Add(dir); err != nil {
-		logger.Fatalf("Failed to watch directory %s: %v", dir, err)
+		logger.Fatalf("Failed to watch dir: %v", err)
 	}
-
-	logger.Printf("Watching config directory: %s", dir)
+	logger.Printf("Watching dir: %s", dir)
 
 	for {
 		select {
@@ -263,9 +238,8 @@ func watchConfigFile() {
 				return
 			}
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-				if strings.HasSuffix(event.Name, "config.yaml") ||
-					strings.HasSuffix(event.Name, "maintenance.html") {
-					logger.Printf("Detected change in %s, reloading config...", event.Name)
+				logger.Printf("Detected event: %s on %s", event.Op, event.Name)
+				if strings.HasSuffix(event.Name, "config.yaml") || strings.HasSuffix(event.Name, "maintenance.html") {
 					loadConfig()
 				}
 			}
@@ -273,202 +247,134 @@ func watchConfigFile() {
 			if !ok {
 				return
 			}
-			logger.Printf("fsnotify error: %v", err)
+			logger.Printf("Watcher error: %v", err)
 		}
 	}
 }
 
 func switchToMaintenance() {
-	maintenanceSubsetsMtx.Lock()
-	if len(maintenanceSubsets) == 0 {
-		logger.Println("Cannot switch: maintenance subsets is empty")
-		maintenanceSubsetsMtx.Unlock()
+	// 获取维护页的完整 subsets
+	maintenanceEp, err := clientset.CoreV1().Endpoints(config.Switch.MaintenanceNamespace).Get(context.Background(), config.Switch.MaintenanceService, metav1.GetOptions{})
+	if err != nil {
+		logger.Printf("Failed to get maintenance endpoints: %v", err)
 		return
 	}
-	subsetsToApply := append([]corev1.EndpointSubset{}, maintenanceSubsets...)
-	maintenanceSubsetsMtx.Unlock()
+	maintenanceSubsets := maintenanceEp.Subsets
+	if len(maintenanceSubsets) == 0 {
+		logger.Println("Maintenance endpoints have no subsets, cannot switch")
+		return
+	}
+	logger.Printf("Maintenance subsets fetched (count: %d)", len(maintenanceSubsets))
 
-	for _, t := range config.Switch.Targets {
-		key := fmt.Sprintf("%s/%s", t.Namespace, t.Service)
+	for _, targetGroup := range config.Switch.Targets {
+		for _, svc := range targetGroup.Services {
+			key := fmt.Sprintf("%s/%s", targetGroup.Namespace, svc)
 
-		// 保存原始状态（只保存一次）
-		if _, loaded := originalSubsets.Load(key); !loaded {
-			ep, err := clientset.CoreV1().Endpoints(t.Namespace).Get(context.Background(), t.Service, metav1.GetOptions{})
-			if err == nil && len(ep.Subsets) > 0 {
-				originalSubsets.Store(key, ep.Subsets)
-				logger.Printf("Saved original subsets for %s", key)
+			// 保存原始 subsets
+			targetEp, err := clientset.CoreV1().Endpoints(targetGroup.Namespace).Get(context.Background(), svc, metav1.GetOptions{})
+			if err != nil {
+				logger.Printf("Failed to get target %s: %v", key, err)
+				continue
 			}
+			if _, loaded := originalSubsets.Load(key); !loaded {
+				originalSubsets.Store(key, targetEp.Subsets)
+				logger.Printf("Original subsets saved for %s", key)
+			}
+
+			// 覆盖 subsets
+			patchSubsets(targetGroup.Namespace, svc, maintenanceSubsets)
+
+			// 启动监控
+			ch := make(chan struct{})
+			stopCh.Store(key, ch)
+			go monitorEndpoints(targetGroup.Namespace, svc, maintenanceSubsets, ch)
 		}
-
-		// 第一次强制覆盖
-		patchEndpoints(t.Namespace, t.Service, subsetsToApply)
-
-		// 启动/确保有 watcher
-		startOrRestartWatcher(t.Namespace, t.Service, subsetsToApply)
 	}
 }
 
 func recoverOriginal() {
-	for _, t := range config.Switch.Targets {
-		key := fmt.Sprintf("%s/%s", t.Namespace, t.Service)
+	for _, targetGroup := range config.Switch.Targets {
+		for _, svc := range targetGroup.Services {
+			key := fmt.Sprintf("%s/%s", targetGroup.Namespace, svc)
 
-		// 停止 watcher
-		if ch, ok := watchStopChs.LoadAndDelete(key); ok {
-			if stopCh, isChan := ch.(chan struct{}); isChan {
-				close(stopCh)
+			// 停止监控
+			if chI, loaded := stopCh.LoadAndDelete(key); loaded {
+				close(chI.(chan struct{}))
+				logger.Printf("Monitor stopped for %s", key)
 			}
-		}
 
-		// 恢复原始状态
-		if raw, ok := originalSubsets.LoadAndDelete(key); ok {
-			if subsets, ok := raw.([]corev1.EndpointSubset); ok && len(subsets) > 0 {
-				patchEndpoints(t.Namespace, t.Service, subsets)
-				logger.Printf("Recovered original subsets for %s", key)
+			// 恢复原始
+			if raw, loaded := originalSubsets.LoadAndDelete(key); loaded {
+				subsets := raw.([]corev1.EndpointSubset)
+				patchSubsets(targetGroup.Namespace, svc, subsets)
+			} else {
+				logger.Printf("No original subsets for %s, skip recovery", key)
 			}
 		}
 	}
 }
 
-func patchEndpoints(namespace, name string, subsets []corev1.EndpointSubset) {
-	patchData := map[string]interface{}{
-		"subsets": subsets,
-	}
-
-	patchBytes, err := json.Marshal(patchData)
+func patchSubsets(namespace, svc string, subsets []corev1.EndpointSubset) {
+	patchData, err := json.Marshal(map[string]interface{}{"subsets": subsets})
 	if err != nil {
-		logger.Printf("Failed to marshal patch data for %s/%s: %v", namespace, name, err)
+		logger.Printf("Marshal failed for %s/%s: %v", namespace, svc, err)
 		return
 	}
 
-	err = wait.PollUntilContextTimeout(context.Background(), time.Second, 10*time.Second, true,
-		func(ctx context.Context) (bool, error) {
-			_, err := clientset.CoreV1().Endpoints(namespace).Patch(
-				ctx,
-				name,
-				types.MergePatchType,
-				patchBytes,
-				metav1.PatchOptions{},
-			)
-			if err != nil {
-				logger.Printf("Patch failed for %s/%s: %v", namespace, name, err)
-				return false, nil
-			}
-			return true, nil
-		})
-
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		_, err := clientset.CoreV1().Endpoints(namespace).Patch(context.Background(), svc, types.MergePatchType, patchData, metav1.PatchOptions{})
+		return err
+	})
 	if err != nil {
-		logger.Printf("Failed to patch %s/%s after retries: %v", namespace, name, err)
+		logger.Printf("Patch failed for %s/%s: %v", namespace, svc, err)
 	} else {
-		logger.Printf("Successfully patched endpoints %s/%s", namespace, name)
+		logger.Printf("Patch success for %s/%s", namespace, svc)
 	}
 }
 
-func startOrRestartWatcher(namespace, service string, desiredSubsets []corev1.EndpointSubset) {
-	key := fmt.Sprintf("%s/%s", namespace, service)
+func monitorEndpoints(namespace, svc string, desired []corev1.EndpointSubset, stop chan struct{}) {
+	logger.Printf("Monitor started for %s/%s", namespace, svc)
 
-	// 先停止旧的（如果存在）
-	if oldCh, loaded := watchStopChs.LoadAndDelete(key); loaded {
-		if ch, ok := oldCh.(chan struct{}); ok {
-			close(ch)
-		}
-	}
-
-	stop := make(chan struct{})
-	watchStopChs.Store(key, stop)
-
-	go func() {
-		defer logger.Printf("Watcher exited for %s", key)
-
-		for {
-			w, err := clientset.CoreV1().Endpoints(namespace).Watch(context.Background(), metav1.ListOptions{
-				FieldSelector:   fmt.Sprintf("metadata.name=%s", service),
-				TimeoutSeconds:  int64Ptr(30),
-				ResourceVersion: "0",
+	for {
+		select {
+		case <-stop:
+			logger.Printf("Monitor stopped for %s/%s", namespace, svc)
+			return
+		default:
+			watcher, err := clientset.CoreV1().Endpoints(namespace).Watch(context.Background(), metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("metadata.name=%s", svc),
 			})
 			if err != nil {
-				logger.Printf("Watch failed for %s: %v, retrying...", key, err)
+				logger.Printf("Watch init failed for %s/%s: %v, retry in 5s", namespace, svc, err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			func() {
-				defer w.Stop()
-
-				for {
-					select {
-					case event, ok := <-w.ResultChan():
-						if !ok {
-							return // channel closed, will restart watch
-						}
-
-						if event.Type == watch.Modified || event.Type == watch.Added {
-							ep, ok := event.Object.(*corev1.Endpoints)
-							if !ok {
-								continue
-							}
-
-							if !subsetsDeepEqual(ep.Subsets, desiredSubsets) {
-								logger.Printf("Detected unwanted change on %s/%s, re-enforcing...", namespace, service)
-								patchEndpoints(namespace, service, desiredSubsets)
-							}
-						}
-
-					case <-stop:
-						return
+			for event := range watcher.ResultChan() {
+				if event.Type == watch.Modified {
+					ep := event.Object.(*corev1.Endpoints)
+					if !reflect.DeepEqual(ep.Subsets, desired) {
+						logger.Printf("Change detected in %s/%s, re-patching", namespace, svc)
+						patchSubsets(namespace, svc, desired)
 					}
 				}
-			}()
-
-			select {
-			case <-stop:
-				return
-			case <-time.After(3 * time.Second):
-				// continue retry
 			}
+			watcher.Stop()
+			logger.Printf("Watch channel closed for %s/%s, restarting", namespace, svc)
+			time.Sleep(5 * time.Second)
 		}
-	}()
-}
-
-func subsetsDeepEqual(a, b []corev1.EndpointSubset) bool {
-	if len(a) != len(b) {
-		return false
 	}
-
-	for i := range a {
-		if len(a[i].Addresses) != len(b[i].Addresses) ||
-			len(a[i].NotReadyAddresses) != len(b[i].NotReadyAddresses) ||
-			len(a[i].Ports) != len(b[i].Ports) {
-			return false
-		}
-		// 这里可以继续做更严格的比较，但大多数场景长度+内容一致就够了
-	}
-
-	return true
 }
 
 func sendTelegram(msg string) {
 	if bot == nil {
 		return
 	}
-
-	message := tgbotapi.NewMessage(config.Telegram.ChatID, msg)
-	message.ParseMode = "MarkdownV2"
-
-	if _, err := bot.Send(message); err != nil {
+	sendMsg := tgbotapi.NewMessage(config.Telegram.ChatID, msg)
+	sendMsg.ParseMode = "Markdown"
+	if _, err := bot.Send(sendMsg); err != nil {
 		logger.Printf("Telegram send failed: %v", err)
 	} else {
 		logger.Printf("Telegram sent: %s", msg)
 	}
-}
-
-func int64Ptr(i int64) *int64 { return &i }
-
-func stopAllWatchers() {
-	watchStopChs.Range(func(key, value interface{}) bool {
-		if ch, ok := value.(chan struct{}); ok {
-			close(ch)
-		}
-		return true
-	})
-	watchStopChs = sync.Map{}
 }
