@@ -2,8 +2,6 @@ package main
 
 import (
     "time"
-
-    "k8s.io/api/core/v1"
 )
 
 type Config struct {

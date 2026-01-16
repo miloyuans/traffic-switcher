@@ -8,7 +8,7 @@ import (
     "go.mongodb.org/mongo-driver/mongo"
     "go.mongodb.org/mongo-driver/mongo/options"
 
-    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"  // Get/Update 需要 metav1.GetOptions{}
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     "k8s.io/klog/v2"
 )
 
@@ -46,8 +46,17 @@ func (c *Controller) backupSelectors(rule *RuleRuntime) error {
 func (c *Controller) restoreSelectors(rule *RuleRuntime) error {
     coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("backups")
     for _, target := range rule.Config.TargetServices {
-        key := bson.M{"rule_domain": rule.Config.Domain, "namespace": target.Namespace, "service": target.Name}
-        cursor, err := coll.Find(context.TODO(), key, options.Find().SetSort(bson.D{"timestamp": -1}).SetLimit(1))
+        key := bson.M{
+            "rule_domain": rule.Config.Domain,
+            "namespace":   target.Namespace,
+            "service":     target.Name,
+        }
+        // 修复：使用 bson.M 进行降序排序（-1）
+        opt := options.Find().
+            SetSort(bson.M{"timestamp": -1}).
+            SetLimit(1)
+
+        cursor, err := coll.Find(context.TODO(), key, opt)
         if err != nil {
             return err
         }
@@ -56,7 +65,9 @@ func (c *Controller) restoreSelectors(rule *RuleRuntime) error {
             continue
         }
         var backup BackupDoc
-        cursor.Decode(&backup)
+        if err := cursor.Decode(&backup); err != nil {
+            return err
+        }
         svc, err := c.clientset.CoreV1().Services(target.Namespace).Get(context.TODO(), target.Name, metav1.GetOptions{})
         if err != nil {
             return err

@@ -1,12 +1,9 @@
 package main
 
 import (
-    "context"
     "flag"
     "os"
     "os/signal"
-    "sync"
-    "time"
 
     "k8s.io/client-go/kubernetes"
     "k8s.io/client-go/rest"

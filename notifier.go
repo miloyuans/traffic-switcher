@@ -4,9 +4,8 @@ import (
     "fmt"
     "time"
 
-    "github.com/google/uuid"                                      // 解决 undefined: uuid
-    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // tgbotapi
-    "k8s.io/klog/v2"
+    "github.com/google/uuid"
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 func (c *Controller) InitTelegram() error {

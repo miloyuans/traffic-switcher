@@ -1,19 +1,17 @@
 package main
 
 import (
-    "context"
-    "io"
     "net/http"
-    "os"       // 新增（可能用到）
+    "os"
     "sync"
     "time"
 
     "github.com/fsnotify/fsnotify"
     "gopkg.in/yaml.v3"
 
-    "k8s.io/client-go/kubernetes"                  // 解决 undefined: kubernetes
-    "go.mongodb.org/mongo-driver/mongo"            // 解决 undefined: mongo
-    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // 解决 undefined: tgbotapi
+    "k8s.io/client-go/kubernetes"
+    "go.mongodb.org/mongo-driver/mongo"
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
     "k8s.io/klog/v2"
 )
 
