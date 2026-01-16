@@ -1,0 +1,185 @@
+---
+# 1. ConfigMap - 存放配置文件和默认维护页面
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-switcher-config
+  namespace: monitoring           # 建议修改成你自己的命名空间
+data:
+  config.yaml: |
+    telegram:
+      token: "YOUR_BOT_TOKEN_HERE"          # ← 替换成真实的 token
+      chat_id: 123456789                    # ← 替换成你的 chat ID
+
+    http:
+      listen_addr: "0.0.0.0"
+      port: "80"
+
+    maintenance:
+      html_path: "/config/maintenance.html"
+
+    switch:
+      force_switch: false
+
+      services:
+        - namespace: "monitoring"
+          services:
+            - "frontend"           # 你要保护/切换的 service 名字
+            - "api-gateway"
+
+  maintenance.html: |
+    <!DOCTYPE html>
+    <html lang="zh">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+      <title>系统维护中</title>
+      <style>
+        body {
+          margin: 0;
+          padding: 0;
+          font-family: -apple-system, BlinkMacOSystemFont, "Segoe UI", Roboto, sans-serif;
+          background: linear-gradient(135deg, #667eea, #764ba2);
+          color: white;
+          height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          text-align: center;
+        }
+        .container {
+          max-width: 600px;
+          padding: 2rem;
+        }
+        h1 { font-size: 3.5rem; margin-bottom: 1rem; }
+        p { font-size: 1.3rem; line-height: 1.6; }
+        .emoji { font-size: 4rem; margin-bottom: 1rem; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="emoji">🛠️</div>
+        <h1>系统维护中</h1>
+        <p>我们正在进行计划内的系统升级与维护，<br/>预计很快就会恢复。</p>
+        <p>给您带来的不便深表歉意，感谢您的理解与耐心等待！</p>
+        <p style="margin-top: 3rem; font-size: 1.1rem; opacity: 0.9;">
+          预计完成时间：正在全力加速中...<br/>
+          如有紧急需求，请联系技术支持
+        </p>
+      </div>
+    </body>
+    </html>
+
+---
+# 2. Service - 暴露 80 端口给 ingress / 外部流量
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-switcher
+  namespace: monitoring
+  labels:
+    app: traffic-switcher
+spec:
+  selector:
+    app: traffic-switcher
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+
+---
+# 3. Deployment - 核心部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-switcher
+  namespace: monitoring
+  labels:
+    app: traffic-switcher
+spec:
+  replicas: 2                    # 建议至少2副本，防止单点
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: traffic-switcher
+  template:
+    metadata:
+      labels:
+        app: traffic-switcher
+    spec:
+      containers:
+        - name: switcher
+          image: your-registry/traffic-switcher:latest   # ← 替换成你自己的镜像
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 80
+              name: http
+
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+          volumeMounts:
+            - name: config-volume
+              mountPath: /config
+              readOnly: true
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: traffic-switcher-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+              - key: maintenance.html
+                path: maintenance.html
+
+---
+# 4. 可选：如果使用 Ingress（推荐）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: traffic-switcher-ingress
+  namespace: monitoring
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # 根据你的 ingress-controller 调整
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: maintenance.your-domain.com           # 可选：如果你想用独立域名
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: traffic-switcher
+                port:
+                  number: 80
