@@ -1,0 +1,30 @@
+global:
+  source_service:
+    namespace: prod
+    name: source-svc
+  probe_interval: 30s
+  expected_codes: [200]
+  telegram:
+    bot_token: "YOUR_BOT_TOKEN"
+    chat_id: 123456789
+  mongodb:
+    uri: "mongodb://user:pass@host:27017"
+    database: traffic_switcher
+    retention_days: 30
+
+rules:
+  - domain: "https://api.example.com/health"
+    expected_codes: [200]
+    force_switch: false
+    target_services:
+      - namespace: prod
+        name: api-svc
+      - namespace: prod
+        name: web-svc
+    notification_message: "API 健康检查失败，建议切换流量"
+  - domain: "https://another.example.com/check"
+    force_switch: false
+    target_services:
+      - namespace: prod
+        name: backend-svc
+    notification_message: "后端服务异常"
