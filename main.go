@@ -22,7 +22,9 @@ import (
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -239,10 +241,11 @@ func watchConfig() {
 			if !ok {
 				return
 			}
-			if (event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create) &&
-				(strings.HasSuffix(event.Name, "config.yaml") || strings.HasSuffix(event.Name, "maintenance.html")) {
-				logger.Printf("Detected change in %s, reloading...", event.Name)
-				loadConfig()
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+				if strings.HasSuffix(event.Name, "config.yaml") || strings.HasSuffix(event.Name, "maintenance.html") {
+					logger.Printf("Detected change in %s, reloading...", event.Name)
+					loadConfig()
+				}
 			}
 		case err, ok := <-watcher.Errors:
 			if !ok {
@@ -270,10 +273,11 @@ func switchToMaintenance() {
 	for _, group := range config.Switch.Targets {
 		for _, svc := range group.Services {
 			key := fmt.Sprintf("%s/%s", group.Namespace, svc)
+
 			// 保存原始 subsets
 			targetEp, err := clientset.CoreV1().Endpoints(group.Namespace).Get(context.Background(), svc, metav1.GetOptions{})
 			if err != nil {
-				logger.Printf("Failed to get target endpoints %s: %v", key, err)
+				logger.Printf("Failed to get target %s: %v", key, err)
 				continue
 			}
 			if _, loaded := originalSubsets.Load(key); !loaded {
@@ -284,7 +288,7 @@ func switchToMaintenance() {
 			// 覆盖 subsets
 			patchSubsets(group.Namespace, svc, maintenanceSubsets)
 
-			// 启动监控
+			// 启动监控（拦截模式）
 			ch := make(chan struct{})
 			stopCh.Store(key, ch)
 			go monitorEndpoints(group.Namespace, svc, maintenanceSubsets, ch)
@@ -296,23 +300,22 @@ func recoverOriginal() {
 	for _, group := range config.Switch.Targets {
 		for _, svc := range group.Services {
 			key := fmt.Sprintf("%s/%s", group.Namespace, svc)
-			// 停止监控
+
+			// 先停止监控（关闭拦截模式）
 			if chI, loaded := stopCh.LoadAndDelete(key); loaded {
 				close(chI.(chan struct{}))
-				logger.Printf("Stopped monitor for %s", key)
+				logger.Printf("Stopped monitor (interception disabled) for %s", key)
 			}
 
 			// 恢复原始 subsets
 			if raw, loaded := originalSubsets.LoadAndDelete(key); loaded {
 				subsets := raw.([]corev1.EndpointSubset)
 				patchSubsets(group.Namespace, svc, subsets)
-				logger.Printf("Recovered subsets for %s", key)
-			} else {
-				logger.Printf("No original for %s, skip", key)
+				logger.Printf("Recovered original subsets for %s", key)
 			}
 
-			// 强制重启关联 Pod（可选，用户建议）
-			restartAssociatedPods(group.Namespace, svc)
+			// 重启关联 Deployment
+			restartAssociatedDeployment(group.Namespace, svc)
 		}
 	}
 }
@@ -336,50 +339,76 @@ func patchSubsets(namespace, svc string, subsets []corev1.EndpointSubset) {
 }
 
 func monitorEndpoints(namespace, svc string, desiredSubsets []corev1.EndpointSubset, stop chan struct{}) {
-	logger.Printf("Starting monitor for %s/%s", namespace, svc)
-
-	ticker := time.NewTicker(10 * time.Second) // 每10秒强制覆盖一次
-	defer ticker.Stop()
+	logger.Printf("Starting interception monitor for %s/%s", namespace, svc)
 
 	for {
 		select {
 		case <-stop:
-			logger.Printf("Monitor stopped for %s/%s", namespace, svc)
+			logger.Printf("Interception monitor stopped for %s/%s", namespace, svc)
 			return
-		case <-ticker.C:
-			// 频繁覆盖
-			logger.Printf("Periodic re-patch for %s/%s", namespace, svc)
-			patchSubsets(namespace, svc, desiredSubsets)
+		default:
+			watcher, err := clientset.CoreV1().Endpoints(namespace).Watch(context.Background(), metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("metadata.name=%s", svc),
+			})
+			if err != nil {
+				logger.Printf("Failed to start watch for %s/%s: %v, retrying in 5s...", namespace, svc, err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			for event := range watcher.ResultChan() {
+				if event.Type == watch.Modified {
+					ep := event.Object.(*corev1.Endpoints)
+					if !reflect.DeepEqual(ep.Subsets, desiredSubsets) {
+						logger.Printf("Detected unauthorized change on %s/%s, intercepting and re-patching...", namespace, svc)
+						patchSubsets(namespace, svc, desiredSubsets)
+					}
+				}
+			}
+
+			watcher.Stop()
+			logger.Printf("Watch channel closed for %s/%s, restarting watch...", namespace, svc)
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
-func restartAssociatedPods(namespace, svc string) {
+func restartAssociatedDeployment(namespace, svc string) {
 	// 获取 service selector
 	service, err := clientset.CoreV1().Services(namespace).Get(context.Background(), svc, metav1.GetOptions{})
 	if err != nil {
-		logger.Printf("Failed to get service %s/%s: %v", namespace, svc, err)
+		logger.Printf("Failed to get service %s/%s for restart: %v", namespace, svc, err)
 		return
 	}
 
-	selector := labels.SelectorFromSet(service.Spec.Selector).String()
-	if selector == "" {
-		logger.Printf("No selector for %s/%s, skip restart", namespace, svc)
+	selector := labels.SelectorFromSet(service.Spec.Selector)
+	if selector.Empty() {
+		logger.Printf("Service %s/%s has no selector, cannot restart deployment", namespace, svc)
 		return
 	}
 
-	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+	// 列出匹配的 Deployment
+	deployments, err := clientset.AppsV1().Deployments(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: selector.String(),
+	})
 	if err != nil {
-		logger.Printf("Failed to list pods for %s/%s: %v", namespace, svc, err)
+		logger.Printf("Failed to list deployments for %s/%s: %v", namespace, svc, err)
 		return
 	}
 
-	for _, pod := range pods.Items {
-		err := clientset.CoreV1().Pods(namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+	if len(deployments.Items) == 0 {
+		logger.Printf("No deployments found for service %s/%s", namespace, svc)
+		return
+	}
+
+	for _, dep := range deployments.Items {
+		// 使用 annotation 触发 rolling restart
+		patch := []byte(fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`, time.Now().Format(time.RFC3339)))
+		_, err := clientset.AppsV1().Deployments(namespace).Patch(context.Background(), dep.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
 		if err != nil {
-			logger.Printf("Failed to delete pod %s: %v", pod.Name, err)
+			logger.Printf("Failed to restart deployment %s: %v", dep.Name, err)
 		} else {
-			logger.Printf("Deleted pod %s to force refresh", pod.Name)
+			logger.Printf("Triggered rolling restart for deployment %s", dep.Name)
 		}
 	}
 }
