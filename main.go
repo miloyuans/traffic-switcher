@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/fsnotify/fsnotify"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -22,17 +21,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/retry"
 )
 
 type Config struct {
 	Telegram struct {
-		Token   string `yaml:"token"`
-		ChatID  int64  `yaml:"chat_id"`
+		Token  string `yaml:"token"`
+		ChatID int64  `yaml:"chat_id"`
 	} `yaml:"telegram"`
 
 	HTTP struct {
@@ -63,8 +60,8 @@ var (
 	htmlTemplate *template.Template
 	logger       = log.New(os.Stdout, "[traffic-switcher] ", log.LstdFlags)
 
-	// 用于记录每个 service 的原始 endpoints
-	originalEndpoints = sync.Map() // key: "ns/svc"  value: []corev1.EndpointSubset
+	// key: "ns/svc"  value: []corev1.EndpointSubset (原始状态)
+	originalEndpoints sync.Map
 )
 
 func main() {
@@ -89,7 +86,7 @@ func main() {
 		logger.Fatalf("Failed to create kubernetes client: %v", err)
 	}
 
-	// 加载配置（首次）
+	// 首次加载配置
 	loadConfig()
 
 	// 启动 http server
@@ -98,7 +95,7 @@ func main() {
 	// 监听配置文件变化
 	go watchConfig()
 
-	// 监听系统信号优雅退出
+	// 等待系统信号退出
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
@@ -124,7 +121,7 @@ func loadConfig() {
 	config = newConfig
 	mu.Unlock()
 
-	// 设置默认值
+	// 默认值
 	if config.HTTP.ListenAddr == "" {
 		config.HTTP.ListenAddr = "0.0.0.0"
 	}
@@ -135,10 +132,10 @@ func loadConfig() {
 		config.Maintenance.HTMLPath = "/config/maintenance.html"
 	}
 
-	// 加载维护页面模板
+	// 加载维护页面
 	loadHTMLTemplate()
 
-	// 初始化 Telegram Bot（如果配置了）
+	// 初始化 Telegram Bot
 	if config.Telegram.Token != "" && config.Telegram.ChatID != 0 {
 		var botErr error
 		bot, botErr = tgbotapi.NewBotAPI(config.Telegram.Token)
@@ -150,7 +147,7 @@ func loadConfig() {
 		}
 	}
 
-	// 根据开关决定是否切换
+	// 开关变化检测
 	shouldSwitch := config.Switch.ForceSwitch
 
 	if shouldSwitch && !oldForce {
@@ -192,10 +189,7 @@ func startHTTPServer() {
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := tmpl.Execute(w, nil); err != nil {
-			logger.Printf("Template execute error: %v", err)
-			http.Error(w, "Template error", http.StatusInternalServerError)
-		}
+		_ = tmpl.Execute(w, nil)
 	})
 
 	addr := fmt.Sprintf("%s:%s", config.HTTP.ListenAddr, config.HTTP.Port)
@@ -259,10 +253,11 @@ func recoverOriginal() {
 		for _, svcName := range group.Services {
 			key := fmt.Sprintf("%s/%s", group.Namespace, svcName)
 			if raw, ok := originalEndpoints.LoadAndDelete(key); ok {
-				subsets := raw.([]corev1.EndpointSubset)
-				patchEndpoints(group.Namespace, svcName, subsets)
+				if subsets, ok := raw.([]corev1.EndpointSubset); ok {
+					patchEndpoints(group.Namespace, svcName, subsets)
+				}
 			} else {
-				logger.Printf("No original endpoints found for %s/%s, skip recover", group.Namespace, svcName)
+				logger.Printf("No original endpoints found for %s/%s", group.Namespace, svcName)
 			}
 		}
 	}
@@ -277,13 +272,13 @@ func switchService(namespace, svcName string, targetIPs []string) {
 		return
 	}
 
-	// 保存原始状态（如果还没保存）
+	// 保存原始状态（仅第一次）
 	if _, loaded := originalEndpoints.Load(key); !loaded {
 		originalEndpoints.Store(key, ep.Subsets)
 		logger.Printf("Saved original endpoints for %s/%s", namespace, svcName)
 	}
 
-	// 构造新的 subsets，只保留端口信息，地址全部换成我们自己的 pod IPs
+	// 构造新的 subsets
 	var newSubsets []corev1.EndpointSubset
 	if len(ep.Subsets) > 0 {
 		newSubsets = []corev1.EndpointSubset{{
@@ -291,7 +286,7 @@ func switchService(namespace, svcName string, targetIPs []string) {
 			Ports:     ep.Subsets[0].Ports,
 		}}
 	} else {
-		logger.Printf("Warning: %s/%s has no subsets, cannot determine ports", namespace, svcName)
+		logger.Printf("Warning: %s/%s has no subsets, cannot switch", namespace, svcName)
 		return
 	}
 
@@ -304,21 +299,18 @@ func patchEndpoints(namespace, svcName string, subsets []corev1.EndpointSubset) 
 	}
 	patchBytes, _ := json.Marshal(patch)
 
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		_, err := clientset.CoreV1().Endpoints(namespace).Patch(
-			context.Background(),
-			svcName,
-			types.MergePatchType,
-			patchBytes,
-			metav1.PatchOptions{},
-		)
-		return err
-	})
+	_, err := clientset.CoreV1().Endpoints(namespace).Patch(
+		context.Background(),
+		svcName,
+		types.MergePatchType,
+		patchBytes,
+		metav1.PatchOptions{},
+	)
 
 	if err != nil {
 		logger.Printf("Failed to patch endpoints %s/%s: %v", namespace, svcName, err)
 	} else {
-		logger.Printf("Endpoints patched successfully: %s/%s", namespace, svcName)
+		logger.Printf("Endpoints patched: %s/%s", namespace, svcName)
 	}
 }
 
@@ -330,11 +322,11 @@ func toEndpointAddresses(ips []string) []corev1.EndpointAddress {
 	return addrs
 }
 
+// 当前仅支持单 Pod 方式（通过环境变量 POD_IP）
 func getMyPodIPs() []string {
-	// 简单实现：假设 Deployment 里设置了环境变量 POD_IP
-	// 生产环境建议使用更可靠的方式（如 downward API 或 informer）
 	ip := os.Getenv("POD_IP")
 	if ip == "" {
+		logger.Println("POD_IP environment variable not set")
 		return nil
 	}
 	return []string{ip}
