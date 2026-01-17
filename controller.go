@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context" // context is often used in controller methods, good to include
 	"net/url"
 	"os"
 	"sync"
@@ -183,32 +182,6 @@ func (c *Controller) StartProbers() {
 			}
 		}(rule)
 	}
-}
-
-// probeAndAct 是一个占位符，假定在其他地方（例如在 storage.go 或者一个新的 prober.go 中）实现了该方法。
-// 它的职责是执行实际的探测并根据结果进行切换和通知。
-// 由于它需要访问 Controller 的字段 (如 clientset, tgBot, mongoClient)，
-// 因此它必须是 Controller 的一个方法。
-func (c *Controller) probeAndAct(rule *RuleRuntime) {
-    // 实际的探测逻辑、状态更新、切换 K8s Service Selector、发送 Telegram 通知等将在这里实现。
-    // 这部分逻辑是您业务的核心，这里仅作为占位符。
-	klog.V(2).Infof("Executing probe and act for rule: %s", rule.Config.BaseDomain)
-
-    // Example placeholder:
-    // isHealthy := c.performHealthChecks(rule)
-    // if isHealthy {
-    //    c.handleHealthyState(rule)
-    // } else {
-    //    c.handleUnhealthyState(rule)
-    // }
-
-    // This method would likely call other Controller methods like:
-    // - c.backupSelectors(...)
-    // - c.restoreSelectors(...)
-    // - c.updateUserCache(...)
-    // - c.logEvent(...)
-    // - c.tgBot.Send(...)
-    // It would also update the rule's runtime state: rule.IsSwitched, rule.LastProbeOK, rule.CurrentStreak, etc.
 }
 
 // 示例：这是一个假设的方法，用于在 Controller 初始化后设置 Kubernetes 客户端。
