@@ -18,7 +18,7 @@ type GlobalConfig struct {
     ExpectedCodes []int  `yaml:"expected_codes"`
     Telegram      struct {
         BotToken string `yaml:"bot_token"`
-        ChatID   int64  `yaml:"chat_id"`
+        ChatID   string `yaml:"chat_id"`  // 修改为 string，支持负数、长ID、带引号字符串
     } `yaml:"telegram"`
     MongoDB struct {
         URI           string `yaml:"uri"`

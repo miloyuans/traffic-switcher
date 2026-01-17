@@ -2,6 +2,7 @@ package main
 
 import (
     "fmt"
+    "strconv" // 新增：用于 string → int64 转换
     "strings"
     "time"
 
@@ -22,6 +23,19 @@ func (c *Controller) InitTelegram() error {
     c.tgBot = bot
     klog.Infof("Telegram Bot initialized: @%s", bot.Self.UserName)
     return nil
+}
+
+// 新增辅助函数：安全解析 chat_id (string → int64)，支持负数群组ID
+func (c *Controller) getChatID() (int64, error) {
+    chatIDStr := c.config.Global.Telegram.ChatID
+    if chatIDStr == "" {
+        return 0, fmt.Errorf("chat_id 配置为空")
+    }
+    chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+    if err != nil {
+        return 0, fmt.Errorf("chat_id 解析失败 (%s): %v", chatIDStr, err)
+    }
+    return chatID, nil
 }
 
 func (c *Controller) HandleTelegramCallbacks() {
@@ -108,7 +122,14 @@ func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason string) 
         msgText = rule.Config.NotificationMessage + "\n\n" + msgText
     }
 
-    msg := tgbotapi.NewMessage(c.config.Global.Telegram.ChatID, msgText)
+    chatID, err := c.getChatID()
+    if err != nil {
+        c.pending.Delete(uid)
+        klog.Errorf("发送确认通知失败: %v", err)
+        return false, err
+    }
+
+    msg := tgbotapi.NewMessage(chatID, msgText)
     keyboard := tgbotapi.NewInlineKeyboardMarkup(
         tgbotapi.NewInlineKeyboardRow(
             tgbotapi.NewInlineKeyboardButtonData("✅ 确认执行", "approve:"+uid),

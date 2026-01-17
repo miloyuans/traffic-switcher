@@ -155,7 +155,14 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
 
 	rule.IsSwitched = true
 	c.logEvent(rule.Config.Domain, "failover_executed", reason)
-	c.tgBot.Send(tgbotapi.NewMessage(c.config.Global.Telegram.ChatID,
+
+	// 使用 getChatID() 发送最终通知（支持 string chat_id 和负数群组）
+	chatID, err := c.getChatID()
+	if err != nil {
+		klog.Errorf("发送最终切换通知失败 (chat_id 无效): %v", err)
+		return
+	}
+	c.tgBot.Send(tgbotapi.NewMessage(chatID,
 		fmt.Sprintf("✅ 已执行流量故障切换: %s\n原因: %s", rule.Config.Domain, reason)))
 }
 
@@ -178,7 +185,14 @@ func (c *Controller) requestRecovery(rule *RuleRuntime) {
 
 	rule.IsSwitched = false
 	c.logEvent(rule.Config.Domain, "recovery_executed", "recovered")
-	c.tgBot.Send(tgbotapi.NewMessage(c.config.Global.Telegram.ChatID,
+
+	// 使用 getChatID() 发送最终通知（支持 string chat_id 和负数群组）
+	chatID, err := c.getChatID()
+	if err != nil {
+		klog.Errorf("发送最终恢复通知失败 (chat_id 无效): %v", err)
+		return
+	}
+	c.tgBot.Send(tgbotapi.NewMessage(chatID,
 		fmt.Sprintf("✅ 已执行流量恢复: %s", rule.Config.Domain)))
 }
 
