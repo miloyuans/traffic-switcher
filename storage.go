@@ -21,6 +21,61 @@ func (c *Controller) InitMongo() error {
     return nil
 }
 
+func (c *Controller) getCachedUsername(userID int64) (string, error) {
+    coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("user_cache")
+
+    var doc UserCacheDoc
+    err := coll.FindOne(context.TODO(), bson.M{"user_id": userID}).Decode(&doc)
+    if err != nil {
+        if err == mongo.ErrNoDocuments {
+            return "", fmt.Errorf("no cache")
+        }
+        return "", err
+    }
+
+    // 缓存过期（1小时）
+    if time.Since(doc.LastUpdated) > 1*time.Hour {
+        return "", fmt.Errorf("cache expired")
+    }
+
+    if doc.Username == "" {
+        return fmt.Sprintf("%d", userID), nil // fallback UserID
+    }
+    return doc.Username, nil
+}
+
+func (c *Controller) updateUserCache(userID int64, username string) error {
+    coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("user_cache")
+
+    filter := bson.M{"user_id": userID}
+    update := bson.M{
+        "$set": bson.M{
+            "username":     username,
+            "last_updated": time.Now(),
+        },
+    }
+    opts := options.Update().SetUpsert(true)
+
+    _, err := coll.UpdateOne(context.TODO(), filter, update, opts)
+    return err
+}
+
+func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (string, error) {
+    member, err := c.tgBot.GetChatMember(tgbotapi.ChatMemberConfig{
+        ChatID: tgbotapi.ChatID(chatID),
+        UserID: int(userID),
+    })
+    if err != nil {
+        return "", err
+    }
+
+    username := member.User.UserName
+    if username == "" {
+        return fmt.Sprintf("%d", userID), nil // fallback UserID
+    }
+    return username, nil
+}
+
 func (c *Controller) backupSelectors(rule *RuleRuntime) error {
     coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("backups")
     for _, target := range rule.Config.TargetServices {

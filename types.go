@@ -66,3 +66,10 @@ type EventDoc struct {
     Action     string    `bson:"action"`
     Message    string    `bson:"message"`
 }
+
+// Telegram 用户缓存结构（MongoDB）
+type UserCacheDoc struct {
+    UserID      int64     `bson:"user_id"`
+    Username    string    `bson:"username"`
+    LastUpdated time.Time `bson:"last_updated"`
+}

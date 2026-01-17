@@ -4,6 +4,7 @@ import (
     "fmt"
     "strconv"
     "strings"
+    "sync"
     "time"
 
     "github.com/google/uuid"
@@ -37,6 +38,53 @@ func (c *Controller) getChatID() (int64, error) {
     return chatID, nil
 }
 
+// 新增：获取授权用户@列表（实时查询 Telegram + Mongo 缓存）
+func (c *Controller) getAuthorizedMentions(rule *RuleRuntime) string {
+    if len(rule.Config.AuthorizedUserIDs) == 0 {
+        return "" // 无授权限制
+    }
+
+    chatID, err := c.getChatID()
+    if err != nil {
+        klog.Errorf("获取 chat_id 失败，无法查询用户名: %v", err)
+        return ""
+    }
+
+    var mentions []string
+    for _, userID := range rule.Config.AuthorizedUserIDs {
+        // 先查缓存（调用 storage.go 中的函数）
+        username, cacheErr := c.getCachedUsername(userID)
+        if cacheErr != nil {
+            // 缓存 miss 或过期，实时查询
+            fetchedUsername, fetchErr := c.fetchUsernameFromTelegram(userID, chatID)
+            if fetchErr != nil {
+                klog.Warningf("查询用户 %d username 失败: %v，使用 UserID 替代", userID, fetchErr)
+                mentions = append(mentions, fmt.Sprintf("UserID:%d", userID))
+            } else {
+                // 更新缓存
+                c.updateUserCache(userID, fetchedUsername)
+                if fetchedUsername != "" {
+                    mentions = append(mentions, "@"+fetchedUsername)
+                } else {
+                    mentions = append(mentions, fmt.Sprintf("UserID:%d", userID))
+                }
+            }
+        } else {
+            // 缓存命中
+            if username != "" {
+                mentions = append(mentions, "@"+username)
+            } else {
+                mentions = append(mentions, fmt.Sprintf("UserID:%d", userID))
+            }
+        }
+    }
+
+    if len(mentions) > 0 {
+        return "\n\n@授权用户: " + strings.Join(mentions, " ")
+    }
+    return ""
+}
+
 func (c *Controller) HandleTelegramCallbacks() {
     for {
         u := tgbotapi.NewUpdate(0)
@@ -55,10 +103,10 @@ func (c *Controller) HandleTelegramCallbacks() {
             }
 
             callback := update.CallbackQuery
+            userID := callback.From.ID
             klog.Infof("收到按钮点击！用户: %s (%d), 数据: %s, 消息ID: %d",
-                callback.From.UserName, callback.From.ID, callback.Data, callback.Message.MessageID)
+                callback.From.UserName, userID, callback.Data, callback.Message.MessageID)
 
-            // 权限检查：从 pending 中获取对应 rule，检查用户ID是否授权
             data := callback.Data
             var approved bool
             var prefix string
@@ -76,20 +124,42 @@ func (c *Controller) HandleTelegramCallbacks() {
 
             uid := data[len(prefix):]
 
-            // 查找 pending rule 并检查权限
-            if chAny, ok := c.pending.Load(uid); ok {
-                // 注意：这里假设 pending 关联 rule（实际需扩展 pending 存 rule 或从 uid 映射，简化见下文建议）
-                // 为简化，假设您在 sendConfirmation 时可记录 rule
-                // 当前版本：仅检查（如果无授权列表，允许所有）
-                // 实际权限检查需在 sendConfirmation 时记录 rule 到 pending，或另存 map[uid]*RuleRuntime
-                // 为完整，我在 sendConfirmation 中添加记录
+            // 获取关联的 rule 用于权限检查
+            var rule *RuleRuntime
+            if rAny, ok := c.pendingRule.Load(uid); ok {
+                rule = rAny.(*RuleRuntime)
+            } else {
+                klog.Warningf("未找到对应 UID 的 rule: %s", uid)
+                c.answerCallback(callback.ID, "操作已过期")
+                continue
+            }
 
+            // 严格权限检查
+            if len(rule.Config.AuthorizedUserIDs) > 0 {
+                authorized := false
+                for _, id := range rule.Config.AuthorizedUserIDs {
+                    if int64(userID) == id {
+                        authorized = true
+                        break
+                    }
+                }
+                if !authorized {
+                    c.answerCallback(callback.ID, "❌ 无权限操作")
+                    klog.Warningf("用户 %d 无权限操作 rule %s", userID, rule.Config.Domain)
+                    continue
+                }
+            }
+
+            // 权限通过，发送结果到通道
+            if chAny, ok := c.pending.Load(uid); ok {
                 ch := chAny.(chan bool)
                 ch <- approved
                 close(ch)
                 c.pending.Delete(uid)
+                c.pendingRule.Delete(uid)
+                klog.Infof("授权用户 %d 操作生效: approved=%v", userID, approved)
             } else {
-                klog.Warningf("未找到对应 pending UID: %s", uid)
+                klog.Warningf("未找到对应 pending channel: %s", uid)
             }
 
             text := "✅ 已确认"
@@ -132,6 +202,7 @@ func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason string) 
     uid := uuid.New().String()
     ch := make(chan bool, 1)
     c.pending.Store(uid, ch)
+    c.pendingRule.Store(uid, rule) // 保存 rule 用于权限检查和@用户
 
     // 自定义模板优先
     template := rule.Config.NotificationMessage // fallback 旧字段
@@ -145,18 +216,16 @@ func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason string) 
     display := buildDisplayDomains(rule.Config.DisplayDomains)
     msgText := strings.ReplaceAll(template, "{{display_domains}}", display)
 
-    // 添加授权用户提示（仅文本提示，Telegram 无法用 ID @，只能提示）
-    if len(rule.Config.AuthorizedUserIDs) > 0 {
-        msgText += "\n\n⚠️ 仅以下用户可操作："
-        for _, id := range rule.Config.AuthorizedUserIDs {
-            msgText += fmt.Sprintf("\nUserID: %d", id)
-        }
-    }
+    // 添加@授权用户（实时查询 + 缓存）
+    mentions := c.getAuthorizedMentions(rule)
+    msgText += mentions
+
     msgText += "\n请在10分钟内确认操作"
 
     chatID, err := c.getChatID()
     if err != nil {
         c.pending.Delete(uid)
+        c.pendingRule.Delete(uid)
         klog.Errorf("发送确认通知失败: %v", err)
         return false, err
     }
@@ -173,18 +242,17 @@ func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason string) 
     sentMsg, err := c.tgBot.Send(msg)
     if err != nil {
         c.pending.Delete(uid)
+        c.pendingRule.Delete(uid)
         return false, fmt.Errorf("发送通知失败: %v", err)
     }
     klog.Infof("已发送交互通知消息，MessageID: %d, UID: %s", sentMsg.MessageID, uid)
 
     select {
     case approved := <-ch:
-        // 权限检查：在收到回调后检查（HandleTelegramCallbacks 中需扩展检查 AuthorizedUserIDs）
-        // 当前简化：假设所有点击有效；实际需在回调时检查 callback.From.ID 是否在 rule.AuthorizedUserIDs
-        // 建议扩展 pending 存 struct{ ch chan bool; rule *RuleRuntime } 或另 map
         return approved, nil
     case <-time.After(10 * time.Minute):
         c.pending.Delete(uid)
+        c.pendingRule.Delete(uid)
         klog.Warningf("审批超时 (UID: %s)，操作已取消", uid)
         c.answerCallback("", "操作超时，已自动取消")
         return false, fmt.Errorf("approval timeout")
