@@ -63,13 +63,13 @@ func (c *Controller) updateUserCache(userID int64, username string) error {
     return err
 }
 
-// 实时查询 Telegram username（修复为库 v5 正确结构）
+// 实时查询 Telegram username（使用库 v5 正确的 ChatConfigWithUser 结构）
 func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (string, error) {
-    config := tgbotapi.ChatMemberConfig{
+    config := tgbotapi.ChatConfigWithUser{
         ChatConfig: tgbotapi.ChatConfig{
-            ChatID: chatID, // ChatID 是嵌套在 ChatConfig 中的 interface{}
+            ChatID: chatID,
         },
-        UserID: int(userID), // UserID 是 int 类型
+        UserID: int(userID), // UserID 字段是 int 类型
     }
 
     member, err := c.tgBot.GetChatMember(config)
