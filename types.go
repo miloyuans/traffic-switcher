@@ -49,7 +49,7 @@ type RuleConfig struct {
 	ProbeInterval                  string            `yaml:"probe_interval"`                  // rule 级探测间隔，覆盖全局
 	ConfirmCount                   int               `yaml:"confirm_count"`                   // 连续多少次才确认状态，默认 1
 	ForceSwitch                    bool              `yaml:"force_switch"`
-	TargetServices                 []ServiceRef      `yaml:"target_services"`	
+	TargetServices                 []ServiceRef      `yaml:"target_services"`
 	NotificationMessage            string            `yaml:"notification_message"`
 	FailoverMessageTemplate        string            `yaml:"failover_message_template"`
 	RecoveryMessageTemplate        string            `yaml:"recovery_message_template"`
@@ -63,6 +63,7 @@ type ServiceRef struct {
 	Namespace        string            `yaml:"namespace"`
 	Name             string            `yaml:"name"`
 	OriginalSelector map[string]string `yaml:"original_selector,omitempty"` // 可选：该 Service 的原始正确 Selector
+}
 
 type RuleRuntime struct {
 	Config        RuleConfig
