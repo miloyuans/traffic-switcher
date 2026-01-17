@@ -2,14 +2,14 @@ package main
 
 import (
     "context"
-    "fmt"      // 新增：用于 fmt.Errorf 和 fmt.Sprintf
+    "fmt"
     "time"
 
     "go.mongodb.org/mongo-driver/bson"
     "go.mongodb.org/mongo-driver/mongo"
     "go.mongodb.org/mongo-driver/mongo/options"
 
-    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // 新增：用于 GetChatMember 和 ChatID
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     "k8s.io/klog/v2"
@@ -65,10 +65,12 @@ func (c *Controller) updateUserCache(userID int64, username string) error {
 
 // 实时查询 Telegram username
 func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (string, error) {
-    member, err := c.tgBot.GetChatMember(tgbotapi.ChatMemberConfig{
-        ChatID: tgbotapi.ChatID(chatID),
-        UserID: int(userID),
-    })
+    config := tgbotapi.GetChatMemberConfig{
+        ChatID: chatID,         // int64 直接兼容 interface{}
+        UserID: int(userID),    // UserID 字段是 int，需要 cast
+    }
+
+    member, err := c.tgBot.GetChatMember(config)
     if err != nil {
         return "", err
     }
@@ -107,7 +109,6 @@ func (c *Controller) restoreSelectors(rule *RuleRuntime) error {
             "namespace":   target.Namespace,
             "service":     target.Name,
         }
-        // 修复：使用 bson.M 进行降序排序（-1）
         opt := options.Find().
             SetSort(bson.M{"timestamp": -1}).
             SetLimit(1)
