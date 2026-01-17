@@ -2,11 +2,14 @@ package main
 
 import (
     "context"
+    "fmt"      // 新增：用于 fmt.Errorf 和 fmt.Sprintf
     "time"
 
     "go.mongodb.org/mongo-driver/bson"
     "go.mongodb.org/mongo-driver/mongo"
     "go.mongodb.org/mongo-driver/mongo/options"
+
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"  // 新增：用于 GetChatMember 和 ChatID
 
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     "k8s.io/klog/v2"
