@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -13,6 +14,11 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// 注意：请先从 controller.go 文件中完全删除以下两个旧函数（避免重复定义错误）：
+// - func (c *Controller) probeAndAct(...)
+// - func (c *Controller) probeURL(...)
+// 删除后保存 controller.go，然后使用以下完整代码替换 prober.go
 
 func (c *Controller) probeAndAct(rule *RuleRuntime) {
 	c.mu.RLock()
@@ -26,10 +32,22 @@ func (c *Controller) probeAndAct(rule *RuleRuntime) {
 
 	klog.Infof("【探测开始】域名: %s, 期望状态码: %v", rule.Config.Domain, expected)
 
-	ok, statusCode, err := c.probeURL(rule.Config.Domain)
+	statusCode, err := c.probeURL(rule.Config.Domain)
 	if err != nil {
 		klog.Errorf("【探测失败】域名: %s, 错误: %v", rule.Config.Domain, err)
-	} else {
+		// 探测错误视为不正常
+		statusCode = 0
+	}
+
+	ok := false
+	for _, code := range expected {
+		if statusCode == code {
+			ok = true
+			break
+		}
+	}
+
+	if err == nil {
 		klog.Infof("【探测结果】域名: %s, 返回状态码: %d, 是否符合期望: %v", rule.Config.Domain, statusCode, ok)
 	}
 
@@ -59,12 +77,12 @@ func (c *Controller) probeAndAct(rule *RuleRuntime) {
 	}
 }
 
-// probeURL 只负责 HTTP 请求，返回是否成功、状态码和错误（不处理 expected 比较）
-func (c *Controller) probeURL(urlStr string) (ok bool, statusCode int, err error) {
+// probeURL 只负责 HTTP 请求和返回状态码（不判断 ok，ok 判断在外层使用 rule-specific expected）
+func (c *Controller) probeURL(urlStr string) (statusCode int, err error) {
 	// 添加超时防止挂死
 	client := &http.Client{
 		Timeout: 10 * time.Second,
-		// 可选：禁止跳转，避免 301/302 干扰
+		// 禁止自动跳转，避免 301/302 被重定向后状态码变化
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -72,27 +90,14 @@ func (c *Controller) probeURL(urlStr string) (ok bool, statusCode int, err error
 
 	resp, err := client.Get(urlStr)
 	if err != nil {
-		return false, 0, err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
-	// 读取 body（可选，避免大响应卡住，但这里仅探测状态码，通常不需要读 body）
-	// io.Copy(ioutil.Discard, resp.Body)
+	// 可选：丢弃 body，防止大响应卡住（仅状态码探测时推荐）
+	io.Copy(io.Discard, resp.Body)
 
-	// 从 rule 获取 expected（这里无法直接访问 rule，所以只返回状态码，比较在外层）
-	// 注意：ok 判断在外层 probeAndAct 中完成
-	c.mu.RLock()
-	globalCodes := c.config.Global.ExpectedCodes
-	c.mu.RUnlock()
-
-	expected := globalCodes
-	// 注意：rule 特定 expected 在 probeAndAct 中覆盖，这里仅为备用
-	for _, code := range expected {
-		if resp.StatusCode == code {
-			return true, resp.StatusCode, nil
-		}
-	}
-	return false, resp.StatusCode, nil
+	return resp.StatusCode, nil
 }
 
 func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
