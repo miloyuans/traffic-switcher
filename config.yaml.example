@@ -28,3 +28,169 @@ rules:
       - namespace: prod
         name: backend-svc
     notification_message: "后端服务异常"
+
+### v2
+global:
+  source_service:
+    namespace: "production"      # 源 Service（通常是主站 Pod 的 Service）
+    name: "main-service"         # 源 Service 名称
+  probe_interval: "30s"          # 全局默认探测间隔（可被 rule 覆盖）
+  expected_codes:                # 全局默认期望 HTTP 状态码（可被 endpoint 覆盖）
+    - 200
+    - 301
+    - 302
+  telegram:
+    bot_token: "1234567890:AAF..."  # Telegram Bot Token
+    chat_id: "-1001234567890"       # Telegram 群组/频道 ID（字符串格式）
+  mongodb:
+    uri: "mongodb://username:password@host:27017"  # MongoDB 连接 URI
+    database: "traffic_switcher"                   # 数据库名称
+    retention_days: 30                             # 事件日志和备份保留天数
+
+rules:
+  - base_domain: "https://example.com"   # 主域名（必须包含 https:// 或 http://）
+    endpoints:                           # 多个探测端点（所有端点都成功才算健康）
+      - path: "/"                        # 路径
+        method: "GET"                    # GET 或 POST，默认 GET
+        params: {}                       # 可选：GET query 或 POST JSON 参数
+        expected_codes: []               # 可选：覆盖期望状态码（为空则继承 rule/global）
+        expected_body_contains: "OK"     # 可选：响应 body 必须包含此字符串
+      - path: "/health"
+        method: "GET"
+        expected_body_contains: "healthy"
+      - path: "/api/status"
+        method: "POST"
+        params:
+          token: "abc123"
+        expected_codes:
+          - 200
+    probe_interval: "20s"                # 本 rule 探测间隔（覆盖全局）
+    confirm_count: 2                     # 连续探测多少次才确认状态变更（默认 1）
+    force_switch: false                  # 强制切换开关（开启后立即触发切换，仍需人工确认）
+    target_services:                     # 需要切换的目标 Service（通常是备用站入口）
+      - namespace: "production"
+        name: "backup-service-1"
+      - namespace: "production"
+        name: "backup-service-2"
+    display_domains:                     # 用于通知模板中 {{display_domains}} 占位符展示的域名列表
+      - "https://main.example.com"
+      - "https://www.example.com"
+      - "example.com"
+    authorized_user_ids:                 # 可选：仅允许这些 Telegram UserID 操作按钮（为空则无限制）
+      - 123456789
+      - 987654321
+    # 以下为各种通知模板（支持 {{display_domains}} 占位符）
+    failover_message_template: |         # 故障切换确认通知模板（优先）
+      🚨 故障检测到异常，准备切换流量 🚨
+      
+      影响域名：
+      {{display_domains}}
+      
+      原因：健康检查连续失败
+    recovery_message_template: |         # 恢复确认通知模板
+      ✅ 探测恢复正常，准备恢复原流量 ✅
+      
+      影响域名：
+      {{display_domains}}
+    success_failover_message_template: "✅ 已执行流量故障切换\n影响域名：{{display_domains}}"
+    success_recovery_message_template: "✅ 已执行流量恢复\n影响域名：{{display_domains}}"
+
+  # 更多 rule 可继续添加...
+  # - base_domain: "https://another-site.com"
+  #   ...
+
+# 兼容旧版配置（可选）：如果只提供 domain 而无 endpoints，会自动转换为单个默认 endpoint
+# - domain: "https://old.example.com/health"
+
+
+### v3
+global:
+  source_service:
+    namespace: "production"      # 源 Service（通常是主站 Pod 的 Service）
+    name: "main-service"         # 源 Service 名称
+  probe_interval: "30s"          # 全局默认探测间隔（可被 rule 覆盖）
+  expected_codes:                # 全局默认期望 HTTP 状态码（可被 endpoint 覆盖）
+    - 200
+    - 301
+    - 302
+  telegram:
+    bot_token: "1234567890:AAF..."  # Telegram Bot Token（请替换为真实值）
+    chat_id: "-1001234567890"       # Telegram 群组/频道 ID（字符串格式）
+  mongodb:
+    uri: "mongodb://username:password@host:27017"  # MongoDB 连接 URI
+    database: "traffic_switcher"                   # 数据库名称
+    retention_days: 30                             # 事件日志和备份保留天数
+
+rules:
+  - base_domain: "https://hkv2.vpbet.com"   # 主域名（必须包含协议 https:// 或 http://）
+    endpoints:                           # 多个探测端点（所有端点成功才算整体健康）
+      - path: "/"                        # 主页
+        method: "GET"
+        expected_body_contains: ""       # 可选：body 包含检查（为空则不检查）
+      - path: "/health"                  # 健康检查路径示例
+        method: "GET"
+        expected_body_contains: "healthy"
+      - path: "/api/status"              # API 示例
+        method: "POST"
+        params:
+          token: "your_token"
+        expected_codes:
+          - 200
+    probe_interval: "20s"                # 本 rule 探测间隔（可选，覆盖全局）
+    confirm_count: 3                     # 连续探测多少次才确认状态变更（推荐 2~3，避免误判）
+    force_switch: false                  # 强制切换开关（手动开启后立即触发，仍需人工确认）
+    target_services:                     # 需要切换的目标 Service（备用站入口）
+      - namespace: "global"
+        name: "gaming-websitev2-service"
+      - namespace: "production"
+        name: "backup-service-2"
+    display_domains:                     # 用于 {{display_domains}} 占位符的域名列表（纯域名，程序会自动格式化）
+      - "hkv2.vpbet.com"
+      - "www.vpbet.com"
+      - "vpbet.com"
+    authorized_user_ids:                 # 可选：仅允许这些 Telegram UserID 操作（为空则所有人可操作）
+      - 123456789   # 示例 UserID
+      - 987654321
+
+    # ==================== 最新推荐通知模板（已适配最新代码的探测细节追加） ====================
+    # 代码会在所有确认通知末尾强制追加“探测细节”（包含每个 endpoint 的完整 URL、方法、成功/失败、状态码、body 检查、错误信息等）
+    # 因此模板中无需重复写细节部分，保持简洁即可
+
+    failover_message_template: |         # 故障切换确认通知（最高优先级）
+      🚨【故障告警】检测到服务异常，准备执行流量切换🚨
+      
+      影响域名：
+      {{display_domains}}
+      
+      触发原因：连续 {{confirm_count}} 次健康检查失败
+      
+      请仔细查看下方“故障探测细节”后决定是否确认切换。
+      （若为误报或临时波动，可直接拒绝）
+
+    recovery_message_template: |         # 恢复确认通知（最高优先级）
+      ✅【恢复告警】服务探测已连续正常，准备执行流量恢复✅
+      
+      影响域名：
+      {{display_domains}}
+      
+      触发原因：连续 {{confirm_count}} 次健康检查成功
+      
+      请查看下方“恢复探测细节”确认服务确实稳定后，再确认恢复。
+
+    success_failover_message_template: | # 切换成功后通知
+      ✅【切换成功】已执行流量故障切换
+      
+      影响域名：
+      {{display_domains}}
+      
+      流量已切至备用站，请后续验证业务可用性。
+
+    success_recovery_message_template: |  # 恢复成功后通知
+      ✅【恢复成功】已执行原流量恢复
+      
+      影响域名：
+      {{display_domains}}
+      
+      流量已切回主站，请验证业务正常。
+
+  # 可继续添加更多 rule...

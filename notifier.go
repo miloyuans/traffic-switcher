@@ -213,7 +213,7 @@ func buildDisplayDomains(domains []string) string {
     return strings.Join(lines, "\n")
 }
 
-func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason string) (bool, error) {
+func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason, probeDetails string) (bool, error) {
     uid := uuid.New().String()
     ch := make(chan bool, 1)
     c.pending.Store(uid, ch)
@@ -236,6 +236,11 @@ func (c *Controller) sendConfirmation(rule *RuleRuntime, action, reason string) 
     msgText += mentions
 
     msgText += "\n请在10分钟内确认操作"
+
+    // 新增：如果有探测细节，追加到通知末尾（无论故障还是恢复都显示，便于判断）
+    if probeDetails != "" {
+        msgText += "\n\n" + probeDetails
+    }
 
     chatID, err := c.getChatID()
     if err != nil {

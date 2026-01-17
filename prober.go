@@ -30,15 +30,25 @@ func (c *Controller) probeAndAct(rule *RuleRuntime) {
 
     klog.Infof("【探测开始】base_domain: %s, endpoints 数量: %d", rule.Config.BaseDomain, len(rule.Config.Endpoints))
 
+	// 收集本次所有 endpoint 的探测细节，用于通知中展示
+	var probeDetails []string
+
     // 所有 endpoint 都成功才算 rule 健康
-    allOK := true
-    for i, endpoint := range rule.Config.Endpoints {
-        ok, details := c.probeEndpoint(rule.Config.BaseDomain, endpoint)
-        klog.Infof("【endpoint %d 结果】path: %s, method: %s, 成功: %v, 详情: %s", i+1, endpoint.Path, endpoint.Method, ok, details)
-        if !ok {
-            allOK = false
+     allOK := true
+     for i, endpoint := range rule.Config.Endpoints {
+         ok, details := c.probeEndpoint(rule.Config.BaseDomain, endpoint)
+         klog.Infof("【endpoint %d 结果】path: %s, method: %s, 成功: %v, 详情: %s", i+1, endpoint.Path, endpoint.Method, ok, details)
+        // 格式化细节，便于人类阅读（包含完整 URL）
+        fullPath := rule.Config.BaseDomain
+        if !strings.HasSuffix(fullPath, "/") && !strings.HasPrefix(endpoint.Path, "/") {
+            fullPath += "/"
         }
-    }
+        fullPath += endpoint.Path
+        probeDetails = append(probeDetails, fmt.Sprintf("• %s (%s) → %v\n  %s", fullPath, strings.ToUpper(endpoint.Method), ok, details))
+         if !ok {
+             allOK = false
+         }
+     }
 
     // 连续确认逻辑
     confirmCount := rule.Config.ConfirmCount
@@ -71,21 +81,23 @@ func (c *Controller) probeAndAct(rule *RuleRuntime) {
         rule.LastProbeOK = allOK
     }
 
-    // 状态变化触发
+	// 连续确认逻辑
+    detailsText := strings.Join(probeDetails, "\n")
+
     if rule.LastProbeOK && !prevConfirmedOK && rule.IsSwitched {
         klog.Infof("【状态确认恢复】连续 %d 次健康，触发恢复流程", confirmCount)
-        c.requestRecovery(rule)
+        c.requestRecovery(rule, "health_check_recovered", "恢复探测细节：\n"+detailsText)
         go c.disableForceSwitchIfNeeded(rule)
     } else if !rule.LastProbeOK && prevConfirmedOK {
         klog.Warningf("【状态确认故障】连续 %d 次不健康，触发切换流程", confirmCount)
-        c.requestFailover(rule, "health_check_failed")
+        c.requestFailover(rule, "health_check_failed", "故障探测细节：\n"+detailsText)
     } else if rule.Config.ForceSwitch {
         klog.Warningf("【强制切换】开关开启，触发切换")
-        c.requestFailover(rule, "force_switch")
+        c.requestFailover(rule, "force_switch", "强制切换（无健康检查细节，由 force_switch 开关触发）")
     } else {
-        klog.V(2).Infof("【状态稳定】无需操作，当前确认健康: %v", rule.LastProbeOK)
-    }
-}
+         klog.V(2).Infof("【状态稳定】无需操作，当前确认健康: %v", rule.LastProbeOK)
+     }
+ }
 
 // 新：单个 endpoint 探测
 func (c *Controller) probeEndpoint(baseDomain string, endpoint EndpointConfig) (ok bool, details string) {
@@ -162,7 +174,7 @@ func (c *Controller) probeEndpoint(baseDomain string, endpoint EndpointConfig) (
     return ok, details
 }
 
-func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
+func (c *Controller) requestFailover(rule *RuleRuntime, reason string, probeDetails string) {
 	if rule.IsSwitched {
 		klog.Infof("【故障切换已执行】当前已处于切换状态，跳过重复操作, 域名: %s", rule.Config.Domain)
 		return
@@ -170,7 +182,7 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
 
 	klog.Warningf("【准备故障切换】发送人工确认通知, 域名: %s, 原因: %s", rule.Config.Domain, reason)
 
-	approved, err := c.sendConfirmation(rule, "🚨 故障检测到异常，准备切换流量 🚨", reason)
+	approved, err := c.sendConfirmation(rule, "🚨 故障检测到异常，准备切换流量 🚨", reason, probeDetails)
 	if err != nil || !approved {
 		klog.Warningf("【故障切换取消】人工拒绝或超时, 域名: %s, 错误: %v", rule.Config.Domain, err)
 		c.logEvent(rule.Config.Domain, "failover_denied", reason+" (denied or timeout)")
@@ -235,10 +247,10 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
     c.tgBot.Send(tgbotapi.NewMessage(chatID, msgText))
 }
 
-func (c *Controller) requestRecovery(rule *RuleRuntime) {
+func (c *Controller) requestRecovery(rule *RuleRuntime, reason string, probeDetails string) {
 	klog.Infof("【准备流量恢复】发送人工确认通知, 域名: %s", rule.Config.Domain)
 
-	approved, err := c.sendConfirmation(rule, "✅ 探测恢复正常，准备恢复原流量 ✅", "health_check_recovered")
+	approved, err := c.sendConfirmation(rule, "✅ 探测恢复正常，准备恢复原流量 ✅", reason, probeDetails)
 	if err != nil || !approved {
 		klog.Warningf("【恢复取消】人工拒绝或超时, 域名: %s", rule.Config.Domain)
 		c.logEvent(rule.Config.Domain, "recovery_denied", "denied or timeout")
