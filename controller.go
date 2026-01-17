@@ -40,14 +40,33 @@ func (c *Controller) LoadConfig(path string) error {
     defer c.mu.Unlock()
 
     c.config = &cfg
-    // 重建 runtime rules
     c.rules = make([]RuleRuntime, len(cfg.Rules))
     for i := range cfg.Rules {
-        c.rules[i] = RuleRuntime{
-            Config:      cfg.Rules[i],
-            IsSwitched:  false,
-            LastProbeOK: true, // 初始假设正常
+        runtime := RuleRuntime{
+            Config:       cfg.Rules[i],
+            IsSwitched:   false,
+            LastProbeOK:  true,
+            CurrentStreak: 0,
+            LastStreakOK: true,
         }
+
+        // 兼容旧 domain 配置
+        if runtime.Config.Domain != "" && len(runtime.Config.Endpoints) == 0 {
+            // 解析 path 从 domain
+            u, err := url.Parse(runtime.Config.Domain)
+            if err == nil {
+                runtime.Config.BaseDomain = u.Scheme + "://" + u.Host
+                runtime.Config.Endpoints = []EndpointConfig{
+                    {
+                        Path:          u.Path,
+                        Method:        "GET",
+                        ExpectedCodes: cfg.Global.ExpectedCodes,
+                    },
+                }
+            }
+        }
+
+        c.rules[i] = runtime
     }
 
     klog.Infof("配置文件加载成功！全局间隔: %s, Rules 数量: %d", cfg.Global.ProbeInterval, len(cfg.Rules))
@@ -104,21 +123,41 @@ func (c *Controller) StartProbers() {
     rulesCount := len(c.rules)
     c.mu.RUnlock()
 
-    klog.Infof("启动 %d 个探测器，全局探测间隔: %v", rulesCount, interval)
+    klog.Infof("启动 %d 个探测器", len(c.rules))
 
-    if rulesCount == 0 {
-        klog.Warning("无 rule 可探测，StartProbers 退出")
+    if len(c.rules) == 0 {
+        klog.Warning("无 rule 可探测")
         return
     }
 
     for i := range c.rules {
         rule := &c.rules[i]
+        // rule 级间隔优先
+        intervalStr := rule.Config.ProbeInterval
+        if intervalStr == "" {
+            intervalStr = c.config.Global.ProbeInterval
+        }
+        if intervalStr == "" {
+            intervalStr = "30s"
+        }
+        interval, err := time.ParseDuration(intervalStr)
+        if err != nil {
+            klog.Errorf("rule %s interval 解析失败，使用默认 30s: %v", rule.Config.BaseDomain, err)
+            interval = 30 * time.Second
+        }
+
+        confirmCount := rule.Config.ConfirmCount
+        if confirmCount <= 0 {
+            confirmCount = 1
+        }
+
         go func(r *RuleRuntime) {
             ticker := time.NewTicker(interval)
-            klog.Infof("探测器启动成功 → 域名: %s, 目标 Services: %v", r.Config.Domain, r.Config.TargetServices)
+            klog.Infof("探测器启动 → base_domain: %s, endpoints: %d, interval: %v, confirm_count: %d",
+                r.Config.BaseDomain, len(r.Config.Endpoints), interval, confirmCount)
 
             for range ticker.C {
-                klog.V(1).Infof("开始新一轮探测 → 域名: %s", r.Config.Domain)
+                klog.V(1).Infof("开始新一轮探测 → base_domain: %s", r.Config.BaseDomain)
                 c.probeAndAct(r)
             }
         }(rule)

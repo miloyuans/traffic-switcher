@@ -1,100 +1,163 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"io"
-	"net/http"
-	"strings"
-	"os"
-	"strconv" // 用于 string → int64 转换
-	"time"
+    "bytes"
+    "context"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "net/url"
+    "strconv"
+    "strings"
+    "time"
 
-	"gopkg.in/yaml.v3"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/klog/v2"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/klog/v2"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// probeAndAct 改为处理多 endpoint + 连续确认
 func (c *Controller) probeAndAct(rule *RuleRuntime) {
-	c.mu.RLock()
-	globalCodes := c.config.Global.ExpectedCodes
-	c.mu.RUnlock()
+    if len(rule.Config.Endpoints) == 0 {
+        klog.Warningf("rule 无 endpoints，跳过探测: %s", rule.Config.BaseDomain)
+        return
+    }
 
-	expected := globalCodes
-	if len(rule.Config.ExpectedCodes) > 0 {
-		expected = rule.Config.ExpectedCodes
-	}
+    klog.Infof("【探测开始】base_domain: %s, endpoints 数量: %d", rule.Config.BaseDomain, len(rule.Config.Endpoints))
 
-	klog.Infof("【探测开始】域名: %s, 期望状态码: %v", rule.Config.Domain, expected)
+    // 所有 endpoint 都成功才算 rule 健康
+    allOK := true
+    for i, endpoint := range rule.Config.Endpoints {
+        ok, details := c.probeEndpoint(rule.Config.BaseDomain, endpoint)
+        klog.Infof("【endpoint %d 结果】path: %s, method: %s, 成功: %v, 详情: %s", i+1, endpoint.Path, endpoint.Method, ok, details)
+        if !ok {
+            allOK = false
+        }
+    }
 
-	statusCode, err := c.probeURL(rule.Config.Domain)
-	if err != nil {
-		klog.Errorf("【探测失败】域名: %s, 错误: %v", rule.Config.Domain, err)
-		// 探测错误视为不正常
-		statusCode = 0
-	}
+    // 连续确认逻辑
+    confirmCount := rule.Config.ConfirmCount
+    if confirmCount <= 0 {
+        confirmCount = 1
+    }
 
-	ok := false
-	for _, code := range expected {
-		if statusCode == code {
-			ok = true
-			break
-		}
-	}
+    if allOK {
+        if rule.LastStreakOK {
+            rule.CurrentStreak++
+        } else {
+            rule.CurrentStreak = 1
+            rule.LastStreakOK = true
+        }
+    } else {
+        if !rule.LastStreakOK {
+            rule.CurrentStreak++
+        } else {
+            rule.CurrentStreak = 1
+            rule.LastStreakOK = false
+        }
+    }
 
-	if err == nil {
-		klog.Infof("【探测结果】域名: %s, 返回状态码: %d, 是否符合期望: %v", rule.Config.Domain, statusCode, ok)
-	}
+    klog.Infof("【rule 整体状态】健康: %v, 连续次数: %d / %d", allOK, rule.CurrentStreak, confirmCount)
 
-	prevOK := rule.LastProbeOK
-	rule.LastProbeOK = ok
+    prevConfirmedOK := rule.LastProbeOK
 
-	// 强制切换开关优先处理（即使探测正常，也会触发切换）
-	if rule.Config.ForceSwitch {
-		klog.Warningf("【强制切换开关开启】触发故障切换流程, 域名: %s", rule.Config.Domain)
-		c.requestFailover(rule, "force_switch")
-		// 不 return，继续后续判断，以便在探测恢复正常时自动关闭开关并恢复
-	}
+    // 只有达到 confirm_count 才确认状态变化
+    if rule.CurrentStreak >= confirmCount {
+        rule.LastProbeOK = allOK
+    }
 
-	// 新故障：从正常 → 异常
-	if !ok && prevOK {
-		klog.Warningf("【健康检查失败】新故障检测到，触发故障切换通知, 域名: %s", rule.Config.Domain)
-		c.requestFailover(rule, "health_check_failed")
-	} else if ok && !prevOK && rule.IsSwitched {
-		// 恢复：从异常 → 正常，且当前已切换状态
-		klog.Infof("【健康检查恢复正常】触发流量恢复流程, 域名: %s", rule.Config.Domain)
-		c.requestRecovery(rule)
-		// 如果是从强制开关触发的，恢复后自动关闭开关
-		go c.disableForceSwitchIfNeeded(rule)
-	} else {
-		klog.V(2).Infof("【状态无变化】无需操作, 域名: %s, 当前探测正常: %v, 已切换状态: %v",
-			rule.Config.Domain, ok, rule.IsSwitched)
-	}
+    // 状态变化触发
+    if rule.LastProbeOK && !prevConfirmedOK && rule.IsSwitched {
+        klog.Infof("【状态确认恢复】连续 %d 次健康，触发恢复流程", confirmCount)
+        c.requestRecovery(rule)
+        go c.disableForceSwitchIfNeeded(rule)
+    } else if !rule.LastProbeOK && prevConfirmedOK {
+        klog.Warningf("【状态确认故障】连续 %d 次不健康，触发切换流程", confirmCount)
+        c.requestFailover(rule, "health_check_failed")
+    } else if rule.Config.ForceSwitch {
+        klog.Warningf("【强制切换】开关开启，触发切换")
+        c.requestFailover(rule, "force_switch")
+    } else {
+        klog.V(2).Infof("【状态稳定】无需操作，当前确认健康: %v", rule.LastProbeOK)
+    }
 }
 
-// probeURL 只负责 HTTP 请求和返回状态码（不判断 ok，ok 判断在外层使用 rule-specific expected）
-func (c *Controller) probeURL(urlStr string) (statusCode int, err error) {
-	// 添加超时防止挂死
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		// 禁止自动跳转，避免 301/302 被重定向后状态码变化
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+// 新：单个 endpoint 探测
+func (c *Controller) probeEndpoint(baseDomain string, endpoint EndpointConfig) (ok bool, details string) {
+    method := strings.ToUpper(endpoint.Method)
+    if method == "" {
+        method = "GET"
+    }
 
-	resp, err := client.Get(urlStr)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
+    fullURL := baseDomain
+    if !strings.HasSuffix(fullURL, "/") && !strings.HasPrefix(endpoint.Path, "/") {
+        fullURL += "/"
+    }
+    fullURL += endpoint.Path
 
-	// 可选：丢弃 body，防止大响应卡住（仅状态码探测时推荐）
-	io.Copy(io.Discard, resp.Body)
+    var req *http.Request
+    var err error
 
-	return resp.StatusCode, nil
+    if method == "POST" && len(endpoint.Params) > 0 {
+        jsonBody, _ := json.Marshal(endpoint.Params)
+        req, err = http.NewRequest(method, fullURL, bytes.NewBuffer(jsonBody))
+        req.Header.Set("Content-Type", "application/json")
+        details = fmt.Sprintf("POST JSON body: %s", string(jsonBody))
+    } else {
+        // GET 或无 params
+        if len(endpoint.Params) > 0 {
+            q := url.Values{}
+            for k, v := range endpoint.Params {
+                q.Add(k, v)
+            }
+            fullURL += "?" + q.Encode()
+            details = fmt.Sprintf("GET query: %s", q.Encode())
+        }
+        req, err = http.NewRequest(method, fullURL, nil)
+    }
+
+    if err != nil {
+        return false, fmt.Sprintf("请求创建失败: %v", err)
+    }
+
+    client := &http.Client{Timeout: 10 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return false, fmt.Sprintf("请求失败: %v", err)
+    }
+    defer resp.Body.Close()
+
+    bodyBytes, _ := io.ReadAll(resp.Body)
+    bodyStr := string(bodyBytes)
+
+    // 状态码检查
+    expectedCodes := endpoint.ExpectedCodes
+    if len(expectedCodes) == 0 {
+        // 继承 rule/global
+        c.mu.RLock()
+        expectedCodes = c.config.Global.ExpectedCodes
+        c.mu.RUnlock()
+    }
+    codeOK := false
+    for _, code := range expectedCodes {
+        if resp.StatusCode == code {
+            codeOK = true
+            break
+        }
+    }
+
+    // body 包含检查
+    bodyOK := true
+    if endpoint.ExpectedBodyContains != "" {
+        bodyOK = strings.Contains(bodyStr, endpoint.ExpectedBodyContains)
+    }
+
+    ok = codeOK && bodyOK
+    details += fmt.Sprintf(" | 状态码: %d (期望: %v) | body包含检查: %v", resp.StatusCode, expectedCodes, bodyOK)
+
+    return ok, details
 }
 
 func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
