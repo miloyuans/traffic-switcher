@@ -214,12 +214,18 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string, probeDeta
 			updateErrors = append(updateErrors, fmt.Sprintf("get %s/%s: %v", target.Namespace, target.Name, err))
 			continue
 		}
+
+		oldSelector := cloneMap(svc.Spec.Selector)
+
+		// 明确先清空 Selector（确保无残留），再全量覆盖源 Selector
+		svc.Spec.Selector = nil
 		svc.Spec.Selector = sourceSelector
+
 		_, err = c.clientset.CoreV1().Services(target.Namespace).Update(context.TODO(), svc, metav1.UpdateOptions{})
 		if err != nil {
 			updateErrors = append(updateErrors, fmt.Sprintf("update %s/%s: %v", target.Namespace, target.Name, err))
 		} else {
-			klog.Infof("【切换成功】目标 Service %s/%s 已更新 Selector", target.Namespace, target.Name)
+			klog.Infof("【切换成功】目标 Service %s/%s Selector 从 %v → %v", target.Namespace, target.Name, oldSelector, sourceSelector)
 		}
 	}
 
@@ -228,23 +234,23 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string, probeDeta
 	}
 
 	rule.IsSwitched = true
-    c.logEvent(rule.Config.Domain, "failover_executed", reason)
+	c.logEvent(rule.Config.Domain, "failover_executed", reason)
 
-    // 自定义成功切换通知模板
-    template := "✅ 已执行流量故障切换\n原因: " + reason // 默认 fallback
-    if rule.Config.SuccessFailoverMessageTemplate != "" {
-        template = rule.Config.SuccessFailoverMessageTemplate
-    }
+	// 自定义成功切换通知模板
+	template := "✅ 已执行流量故障切换\n原因: " + reason // 默认 fallback
+	if rule.Config.SuccessFailoverMessageTemplate != "" {
+		template = rule.Config.SuccessFailoverMessageTemplate
+	}
 
-    display := buildDisplayDomains(rule.Config.DisplayDomains)
-    msgText := strings.ReplaceAll(template, "{{display_domains}}", display)
+	display := buildDisplayDomains(rule.Config.DisplayDomains)
+	msgText := strings.ReplaceAll(template, "{{display_domains}}", display)
 
-    chatID, err := c.getChatID()
-    if err != nil {
-        klog.Errorf("发送最终切换成功通知失败 (chat_id 无效): %v", err)
-        return
-    }
-    c.tgBot.Send(tgbotapi.NewMessage(chatID, msgText))
+	chatID, err := c.getChatID()
+	if err != nil {
+		klog.Errorf("发送最终切换成功通知失败 (chat_id 无效): %v", err)
+		return
+	}
+	c.tgBot.Send(tgbotapi.NewMessage(chatID, msgText))
 }
 
 func (c *Controller) requestRecovery(rule *RuleRuntime, reason string, probeDetails string) {

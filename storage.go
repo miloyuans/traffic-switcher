@@ -104,17 +104,36 @@ func (c *Controller) backupSelectors(rule *RuleRuntime) error {
 		if err != nil {
 			return err
 		}
-		doc := BackupDoc{ // BackupDoc is now defined in types.go
-			RuleDomain: rule.Config.Domain,
+
+		// 优化：备份前记录当前 Selector，并根据是否有 original_selector 输出不同日志
+		currentSelector := cloneMap(svc.Spec.Selector)
+
+		ruleIdentifier := rule.Config.BaseDomain
+		if ruleIdentifier == "" {
+			ruleIdentifier = rule.Config.Domain // 兼容旧配置
+		}
+
+		if len(target.OriginalSelector) > 0 {
+			klog.Infof("【备份】rule %s → Service %s/%s 当前 Selector: %v （恢复时将优先使用配置的 original_selector: %v）",
+				ruleIdentifier, target.Namespace, target.Name, currentSelector, target.OriginalSelector)
+		} else {
+			klog.Infof("【备份】rule %s → Service %s/%s 当前 Selector: %v （恢复时将使用此备份）",
+				ruleIdentifier, target.Namespace, target.Name, currentSelector)
+		}
+
+		doc := BackupDoc{
+			RuleDomain: ruleIdentifier, // 使用 BaseDomain 或 Domain 作为标识
 			Namespace:  target.Namespace,
 			Service:    target.Name,
-			Selector:   cloneMap(svc.Spec.Selector),
+			Selector:   currentSelector,
 			Timestamp:  time.Now(),
 		}
 		_, err = coll.InsertOne(ctx, doc)
 		if err != nil {
 			return err
 		}
+
+		klog.Infof("【备份成功】Service %s/%s 当前 Selector 已备份: %v", target.Namespace, target.Name, currentSelector)
 	}
 	return nil
 }
@@ -125,32 +144,59 @@ func (c *Controller) restoreSelectors(rule *RuleRuntime) error {
 	ctx := context.Background()
 
 	for _, target := range rule.Config.TargetServices {
-		key := bson.M{
-			"rule_domain": rule.Config.Domain,
-			"namespace":   target.Namespace,
-			"service":     target.Name,
+		ruleIdentifier := rule.Config.BaseDomain
+		if ruleIdentifier == "" {
+			ruleIdentifier = rule.Config.Domain
 		}
 
-		var backup BackupDoc // BackupDoc is now defined in types.go
-		// Using FindOne directly for simplicity when retrieving a single document
-		err := coll.FindOne(ctx, key, options.FindOne().SetSort(bson.M{"timestamp": -1})).Decode(&backup)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				klog.Warningf("No backup found for %s/%s in rule %s", target.Namespace, target.Name, rule.Config.Domain)
-				continue
+		var selectorToRestore map[string]string
+
+		// 优先级1：使用该 Service 配置的 original_selector（硬编码正确值）
+		if len(target.OriginalSelector) > 0 {
+			selectorToRestore = cloneMap(target.OriginalSelector)
+			klog.Infof("【恢复优先使用配置】rule %s → Service %s/%s 使用配置文件中硬编码的 original_selector: %v",
+				ruleIdentifier, target.Namespace, target.Name, selectorToRestore)
+		} else {
+			// 优先级2：使用 Mongo 中的最新备份
+			key := bson.M{
+				"rule_domain": ruleIdentifier,
+				"namespace":   target.Namespace,
+				"service":     target.Name,
 			}
-			return err
+
+			var backup BackupDoc
+			err := coll.FindOne(ctx, key, options.FindOne().SetSort(bson.M{"timestamp": -1})).Decode(&backup)
+			if err != nil {
+				if err == mongo.ErrNoDocuments {
+					klog.Warningf("【恢复警告】rule %s → Service %s/%s 无备份且无 original_selector 配置，跳过恢复（保持当前 Selector 不变）",
+						ruleIdentifier, target.Namespace, target.Name)
+					continue
+				}
+				return err
+			}
+
+			selectorToRestore = cloneMap(backup.Selector)
+			klog.Infof("【恢复使用备份】rule %s → Service %s/%s 使用 Mongo 备份 Selector: %v",
+				ruleIdentifier, target.Namespace, target.Name, selectorToRestore)
 		}
 
 		svc, err := c.clientset.CoreV1().Services(target.Namespace).Get(ctx, target.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
-		svc.Spec.Selector = backup.Selector
+
+		oldSelector := cloneMap(svc.Spec.Selector)
+
+		// 明确先清空 Selector（确保无残留旧 key），再全量覆盖
+		svc.Spec.Selector = nil
+		svc.Spec.Selector = selectorToRestore
+
 		_, err = c.clientset.CoreV1().Services(target.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
 		if err != nil {
 			return err
 		}
+
+		klog.Infof("【恢复成功】Service %s/%s Selector 从 %v → %v", target.Namespace, target.Name, oldSelector, selectorToRestore)
 	}
 	return nil
 }
