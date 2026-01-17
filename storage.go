@@ -24,7 +24,7 @@ func (c *Controller) InitMongo() error {
     if err != nil {
         return err
     }
-    
+
     // Verify connection
     if err := client.Ping(ctx, nil); err != nil {
         return err
@@ -46,7 +46,7 @@ func (c *Controller) getCachedUsername(userID int64) (string, error) {
         return "", err
     }
 
-    // Cache expired (1 hour)
+    // 缓存过期（1小时）
     if time.Since(doc.LastUpdated) > 1*time.Hour {
         return "", fmt.Errorf("cache expired")
     }
@@ -73,13 +73,11 @@ func (c *Controller) updateUserCache(userID int64, username string) error {
     return err
 }
 
-// Real-time query for Telegram username (Fixed for v5 library)
+// 实时查询 Telegram username（使用 v5 库正确结构：ChatConfigWithUser）
 func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (string, error) {
     config := tgbotapi.ChatConfigWithUser{
-        ChatConfig: tgbotapi.ChatConfig{
-            ChatID: chatID,
-        },
-        UserID: int(userID),
+        ChatID: chatID,      // interface{}，int64 兼容
+        UserID: int(userID), // int 类型
     }
 
     member, err := c.tgBot.GetChatMember(config)
@@ -93,7 +91,7 @@ func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (stri
 
 func (c *Controller) backupSelectors(rule *RuleRuntime) error {
     coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("backups")
-    
+
     ctx := context.Background()
 
     for _, target := range rule.Config.TargetServices {
@@ -118,7 +116,7 @@ func (c *Controller) backupSelectors(rule *RuleRuntime) error {
 
 func (c *Controller) restoreSelectors(rule *RuleRuntime) error {
     coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("backups")
-    
+
     ctx := context.Background()
 
     for _, target := range rule.Config.TargetServices {
@@ -152,7 +150,6 @@ func (c *Controller) restoreSelectors(rule *RuleRuntime) error {
 }
 
 func (c *Controller) logEvent(ruleDomain, action, message string) {
-    // Make this non-blocking or just fire-and-forget
     go func() {
         coll := c.mongoClient.Database(c.config.Global.MongoDB.Database).Collection("events")
         doc := EventDoc{
@@ -161,7 +158,6 @@ func (c *Controller) logEvent(ruleDomain, action, message string) {
             Action:     action,
             Message:    message,
         }
-        // Context with timeout prevents hanging
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
         _, err := coll.InsertOne(ctx, doc)
@@ -175,24 +171,23 @@ func (c *Controller) StartCleanupTask() {
     go func() {
         ticker := time.NewTicker(24 * time.Hour)
         defer ticker.Stop()
-        
+
         for range ticker.C {
             cutoff := time.Now().AddDate(0, 0, -c.config.Global.MongoDB.RetentionDays)
             db := c.mongoClient.Database(c.config.Global.MongoDB.Database)
-            
+
             ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-            
+            defer cancel()
+
             _, err1 := db.Collection("events").DeleteMany(ctx, bson.M{"timestamp": bson.M{"$lt": cutoff}})
             if err1 != nil {
                 klog.Errorf("Cleanup events failed: %v", err1)
             }
-            
+
             _, err2 := db.Collection("backups").DeleteMany(ctx, bson.M{"timestamp": bson.M{"$lt": cutoff}})
             if err2 != nil {
                 klog.Errorf("Cleanup backups failed: %v", err2)
             }
-            
-            cancel()
         }
     }()
 }
