@@ -60,6 +60,7 @@ func (c *Controller) updateUserCache(userID int64, username string) error {
     return err
 }
 
+// 实时查询 Telegram username
 func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (string, error) {
     member, err := c.tgBot.GetChatMember(tgbotapi.ChatMemberConfig{
         ChatID: tgbotapi.ChatID(chatID),
@@ -70,9 +71,6 @@ func (c *Controller) fetchUsernameFromTelegram(userID int64, chatID int64) (stri
     }
 
     username := member.User.UserName
-    if username == "" {
-        return fmt.Sprintf("%d", userID), nil // fallback UserID
-    }
     return username, nil
 }
 

@@ -22,6 +22,7 @@ type Controller struct {
     mongoClient *mongo.Client
     tgBot       *tgbotapi.BotAPI
     pending     sync.Map // string(uuid) -> chan bool
+    pendingRule sync.Map // 新增：string(uuid) -> *RuleRuntime，用于权限检查和@用户
     configPath  string   // 新增：配置文件路径，用于写回 force_switch
 }
 
