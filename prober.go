@@ -8,9 +8,12 @@ import (
     "io"
     "net/http"
     "net/url"
+    "os"
     "strconv"
     "strings"
     "time"
+
+    "gopkg.in/yaml.v3"
 
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     "k8s.io/klog/v2"
@@ -103,7 +106,9 @@ func (c *Controller) probeEndpoint(baseDomain string, endpoint EndpointConfig) (
     if method == "POST" && len(endpoint.Params) > 0 {
         jsonBody, _ := json.Marshal(endpoint.Params)
         req, err = http.NewRequest(method, fullURL, bytes.NewBuffer(jsonBody))
-        req.Header.Set("Content-Type", "application/json")
+        if err == nil {
+            req.Header.Set("Content-Type", "application/json")
+        }
         details = fmt.Sprintf("POST JSON body: %s", string(jsonBody))
     } else {
         // GET 或无 params
@@ -135,10 +140,7 @@ func (c *Controller) probeEndpoint(baseDomain string, endpoint EndpointConfig) (
     // 状态码检查
     expectedCodes := endpoint.ExpectedCodes
     if len(expectedCodes) == 0 {
-        // 继承 rule/global
-        c.mu.RLock()
         expectedCodes = c.config.Global.ExpectedCodes
-        c.mu.RUnlock()
     }
     codeOK := false
     for _, code := range expectedCodes {
@@ -155,7 +157,7 @@ func (c *Controller) probeEndpoint(baseDomain string, endpoint EndpointConfig) (
     }
 
     ok = codeOK && bodyOK
-    details += fmt.Sprintf(" | 状态码: %d (期望: %v) | body包含检查: %v", resp.StatusCode, expectedCodes, bodyOK)
+    details += fmt.Sprintf(" | 状态码: %d (期望: %v) | body包含检查: %v (期望: %s)", resp.StatusCode, expectedCodes, bodyOK, endpoint.ExpectedBodyContains)
 
     return ok, details
 }
@@ -272,46 +274,53 @@ func (c *Controller) requestRecovery(rule *RuleRuntime) {
 
 // 恢复后自动关闭强制开关（仅内存 + 尝试写回配置文件，ConfigMap 读只挂载会失败，但不影响核心功能）
 func (c *Controller) disableForceSwitchIfNeeded(rule *RuleRuntime) {
-	if !rule.Config.ForceSwitch {
-		return
-	}
+    if !rule.Config.ForceSwitch {
+        return
+    }
 
-	klog.Infof("【自动关闭强制开关】探测恢复正常，关闭 force_switch, 域名: %s", rule.Config.Domain)
+    klog.Infof("【自动关闭强制开关】探测恢复正常，关闭 force_switch, 域名: %s", rule.Config.Domain)
 
-	rule.Config.ForceSwitch = false
+    rule.Config.ForceSwitch = false
 
-	// 尝试写回配置文件（如果挂载为 readOnly，会失败，仅日志记录）
-	c.mu.Lock()
-	for i := range c.config.Rules {
-		if c.config.Rules[i].Domain == rule.Config.Domain {
-			c.config.Rules[i].ForceSwitch = false
-			break
-		}
-	}
-	data, err := yaml.Marshal(c.config)
-	if err != nil {
-		klog.Errorf("序列化配置失败: %v", err)
-		c.mu.Unlock()
-		return
-	}
-	c.mu.Unlock()
+    // 尝试写回配置文件
+    c.mu.Lock()
+    for i := range c.config.Rules {
+        if c.config.Rules[i].Domain == rule.Config.Domain {
+            c.config.Rules[i].ForceSwitch = false
+            break
+        }
+    }
+    data, err := yaml.Marshal(c.config)
+    if err != nil {
+        klog.Errorf("序列化配置失败: %v", err)
+        c.mu.Unlock()
+        return
+    }
+    c.mu.Unlock()
 
-	if err := os.WriteFile(c.configPath, data, 0644); err != nil {
-		klog.Warningf("【写回配置文件失败】通常因 ConfigMap readOnly 挂载引起，无需担心，开关已内存关闭: %v", err)
-	}
+    if err := os.WriteFile(c.configPath, data, 0644); err != nil {
+        klog.Warningf("【写回配置文件失败】通常因 ConfigMap readOnly 挂载引起，无需担心，开关已内存关闭: %v", err)
+    }
 
-	// 内联转换 chat_id (string → int64)，支持负数群组
-	chatIDStr := c.config.Global.Telegram.ChatID
-	if chatIDStr == "" {
-		klog.Errorf("发送强制开关关闭通知失败: chat_id 配置为空")
-		return
-	}
-	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
-	if err != nil {
-		klog.Errorf("发送强制开关关闭通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
-		return
-	}
+    // 发送通知（使用自定义模板或默认）
+    template := "🔧 强制切换开关已自动关闭"
+    if rule.Config.SuccessRecoveryMessageTemplate != "" { // 复用恢复模板或新增专用模板
+        template = rule.Config.SuccessRecoveryMessageTemplate
+    }
 
-	c.tgBot.Send(tgbotapi.NewMessage(chatID,
-		fmt.Sprintf("🔧 强制切换开关已自动关闭: %s", rule.Config.Domain)))
+    display := buildDisplayDomains(rule.Config.DisplayDomains)
+    msgText := strings.ReplaceAll(template, "{{display_domains}}", display)
+
+    chatIDStr := c.config.Global.Telegram.ChatID
+    if chatIDStr == "" {
+        klog.Errorf("发送强制开关关闭通知失败: chat_id 配置为空")
+        return
+    }
+    chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+    if err != nil {
+        klog.Errorf("发送强制开关关闭通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
+        return
+    }
+
+    c.tgBot.Send(tgbotapi.NewMessage(chatID, msgText))
 }
