@@ -18,7 +18,7 @@ type GlobalConfig struct {
     ExpectedCodes []int  `yaml:"expected_codes"`
     Telegram      struct {
         BotToken string `yaml:"bot_token"`
-        ChatID   string `yaml:"chat_id"`  // 修改为 string，支持负数、长ID、带引号字符串
+        ChatID   string `yaml:"chat_id"`  // string 支持负数群组
     } `yaml:"telegram"`
     MongoDB struct {
         URI           string `yaml:"uri"`
@@ -28,11 +28,15 @@ type GlobalConfig struct {
 }
 
 type RuleConfig struct {
-    Domain              string         `yaml:"domain"`
-    ExpectedCodes       []int          `yaml:"expected_codes"`
-    ForceSwitch         bool           `yaml:"force_switch"`
-    TargetServices      []ServiceRef   `yaml:"target_services"`
-    NotificationMessage string         `yaml:"notification_message"`
+    Domain                 string   `yaml:"domain"`                  // 探测域名（内部使用，不展示在通知）
+    ExpectedCodes          []int    `yaml:"expected_codes"`
+    ForceSwitch            bool     `yaml:"force_switch"`
+    TargetServices         []ServiceRef `yaml:"target_services"`
+    NotificationMessage    string   `yaml:"notification_message"`    // 旧字段，兼容（若新模板未定义，可fallback）
+    FailoverMessageTemplate string  `yaml:"failover_message_template"` // 新：故障切换通知模板
+    RecoveryMessageTemplate string  `yaml:"recovery_message_template"` // 新：恢复通知模板
+    DisplayDomains         []string `yaml:"display_domains"`          // 新：受影响的主域名列表（通知中展示）
+    AuthorizedUserIDs      []int64  `yaml:"authorized_user_ids"`      // 新：允许操作的用户ID列表（多用户）
 }
 
 type ServiceRef struct {
