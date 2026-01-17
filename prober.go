@@ -150,22 +150,23 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
 	}
 
 	rule.IsSwitched = true
-	c.logEvent(rule.Config.Domain, "failover_executed", reason)
+    c.logEvent(rule.Config.Domain, "failover_executed", reason)
 
-	// 内联转换 chat_id (string → int64)，支持负数群组
-	chatIDStr := c.config.Global.Telegram.ChatID
-	if chatIDStr == "" {
-		klog.Errorf("发送最终切换通知失败: chat_id 配置为空")
-		return
-	}
-	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
-	if err != nil {
-		klog.Errorf("发送最终切换通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
-		return
-	}
+    // 自定义成功切换通知模板
+    template := "✅ 已执行流量故障切换\n原因: " + reason // 默认 fallback
+    if rule.Config.SuccessFailoverMessageTemplate != "" {
+        template = rule.Config.SuccessFailoverMessageTemplate
+    }
 
-	c.tgBot.Send(tgbotapi.NewMessage(chatID,
-		fmt.Sprintf("✅ 已执行流量故障切换: %s\n原因: %s", rule.Config.Domain, reason)))
+    display := buildDisplayDomains(rule.Config.DisplayDomains)
+    msgText := strings.ReplaceAll(template, "{{display_domains}}", display)
+
+    chatID, err := c.getChatID()
+    if err != nil {
+        klog.Errorf("发送最终切换成功通知失败 (chat_id 无效): %v", err)
+        return
+    }
+    c.tgBot.Send(tgbotapi.NewMessage(chatID, msgText))
 }
 
 func (c *Controller) requestRecovery(rule *RuleRuntime) {
@@ -186,22 +187,23 @@ func (c *Controller) requestRecovery(rule *RuleRuntime) {
 	}
 
 	rule.IsSwitched = false
-	c.logEvent(rule.Config.Domain, "recovery_executed", "recovered")
+    c.logEvent(rule.Config.Domain, "recovery_executed", "recovered")
 
-	// 内联转换 chat_id (string → int64)，支持负数群组
-	chatIDStr := c.config.Global.Telegram.ChatID
-	if chatIDStr == "" {
-		klog.Errorf("发送最终恢复通知失败: chat_id 配置为空")
-		return
-	}
-	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
-	if err != nil {
-		klog.Errorf("发送最终恢复通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
-		return
-	}
+    // 自定义成功恢复通知模板
+    template := "✅ 已执行流量恢复" // 默认 fallback
+    if rule.Config.SuccessRecoveryMessageTemplate != "" {
+        template = rule.Config.SuccessRecoveryMessageTemplate
+    }
 
-	c.tgBot.Send(tgbotapi.NewMessage(chatID,
-		fmt.Sprintf("✅ 已执行流量恢复: %s", rule.Config.Domain)))
+    display := buildDisplayDomains(rule.Config.DisplayDomains)
+    msgText := strings.ReplaceAll(template, "{{display_domains}}", display)
+
+    chatID, err := c.getChatID()
+    if err != nil {
+        klog.Errorf("发送最终恢复成功通知失败 (chat_id 无效): %v", err)
+        return
+    }
+    c.tgBot.Send(tgbotapi.NewMessage(chatID, msgText))
 }
 
 // 恢复后自动关闭强制开关（仅内存 + 尝试写回配置文件，ConfigMap 读只挂载会失败，但不影响核心功能）

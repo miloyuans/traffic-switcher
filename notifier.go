@@ -182,7 +182,7 @@ func (c *Controller) answerCallback(callbackID, text string) {
     }
 }
 
-// 新：构建展示域名字符串
+/* 构建展示域名字符串
 func buildDisplayDomains(domains []string) string {
     if len(domains) == 0 {
         return "无"
@@ -192,6 +192,22 @@ func buildDisplayDomains(domains []string) string {
         if !strings.HasPrefix(strings.ToLower(d), "http") {
             d = "https://" + d
         }
+        lines = append(lines, "- "+d)
+    }
+    return strings.Join(lines, "\n")
+}
+*/
+
+// 构建展示域名字符串（纯域名，无 https）
+func buildDisplayDomains(domains []string) string {
+    if len(domains) == 0 {
+        return "无"
+    }
+    var lines []string
+    for _, d := range domains {
+        d = strings.TrimPrefix(d, "https://")
+        d = strings.TrimPrefix(d, "http://")
+        d = strings.TrimSuffix(d, "/")
         lines = append(lines, "- "+d)
     }
     return strings.Join(lines, "\n")
