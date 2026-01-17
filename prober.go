@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv" // 用于 string → int64 转换
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -14,11 +15,6 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
-
-// 注意：请先从 controller.go 文件中完全删除以下两个旧函数（避免重复定义错误）：
-// - func (c *Controller) probeAndAct(...)
-// - func (c *Controller) probeURL(...)
-// 删除后保存 controller.go，然后使用以下完整代码替换 prober.go
 
 func (c *Controller) probeAndAct(rule *RuleRuntime) {
 	c.mu.RLock()
@@ -156,12 +152,18 @@ func (c *Controller) requestFailover(rule *RuleRuntime, reason string) {
 	rule.IsSwitched = true
 	c.logEvent(rule.Config.Domain, "failover_executed", reason)
 
-	// 使用 getChatID() 发送最终通知（支持 string chat_id 和负数群组）
-	chatID, err := c.getChatID()
-	if err != nil {
-		klog.Errorf("发送最终切换通知失败 (chat_id 无效): %v", err)
+	// 内联转换 chat_id (string → int64)，支持负数群组
+	chatIDStr := c.config.Global.Telegram.ChatID
+	if chatIDStr == "" {
+		klog.Errorf("发送最终切换通知失败: chat_id 配置为空")
 		return
 	}
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		klog.Errorf("发送最终切换通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
+		return
+	}
+
 	c.tgBot.Send(tgbotapi.NewMessage(chatID,
 		fmt.Sprintf("✅ 已执行流量故障切换: %s\n原因: %s", rule.Config.Domain, reason)))
 }
@@ -186,12 +188,18 @@ func (c *Controller) requestRecovery(rule *RuleRuntime) {
 	rule.IsSwitched = false
 	c.logEvent(rule.Config.Domain, "recovery_executed", "recovered")
 
-	// 使用 getChatID() 发送最终通知（支持 string chat_id 和负数群组）
-	chatID, err := c.getChatID()
-	if err != nil {
-		klog.Errorf("发送最终恢复通知失败 (chat_id 无效): %v", err)
+	// 内联转换 chat_id (string → int64)，支持负数群组
+	chatIDStr := c.config.Global.Telegram.ChatID
+	if chatIDStr == "" {
+		klog.Errorf("发送最终恢复通知失败: chat_id 配置为空")
 		return
 	}
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		klog.Errorf("发送最终恢复通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
+		return
+	}
+
 	c.tgBot.Send(tgbotapi.NewMessage(chatID,
 		fmt.Sprintf("✅ 已执行流量恢复: %s", rule.Config.Domain)))
 }
@@ -226,6 +234,18 @@ func (c *Controller) disableForceSwitchIfNeeded(rule *RuleRuntime) {
 		klog.Warningf("【写回配置文件失败】通常因 ConfigMap readOnly 挂载引起，无需担心，开关已内存关闭: %v", err)
 	}
 
-	c.tgBot.Send(tgbotapi.NewMessage(c.config.Global.Telegram.ChatID,
+	// 内联转换 chat_id (string → int64)，支持负数群组
+	chatIDStr := c.config.Global.Telegram.ChatID
+	if chatIDStr == "" {
+		klog.Errorf("发送强制开关关闭通知失败: chat_id 配置为空")
+		return
+	}
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		klog.Errorf("发送强制开关关闭通知失败: chat_id 解析错误 (%s): %v", chatIDStr, err)
+		return
+	}
+
+	c.tgBot.Send(tgbotapi.NewMessage(chatID,
 		fmt.Sprintf("🔧 强制切换开关已自动关闭: %s", rule.Config.Domain)))
 }
